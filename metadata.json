@@ -1,0 +1,6 @@
+{
+  "name": "Radni Nalozi & Magacin",
+  "description": "Sistem za izdavanje radnih naloga, evidenciju utroška materijala (m³) i radnog vremena, sa ulogama za Admina, Stefana i Draška.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

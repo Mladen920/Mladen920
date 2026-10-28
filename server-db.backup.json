@@ -1,0 +1,95 @@
+{
+  "users": [
+    {
+      "id": "user-admin",
+      "username": "admin",
+      "fullName": "Administrator Radionice",
+      "role": "admin",
+      "password": "admin123",
+      "createdAt": "2026-10-01"
+    },
+    {
+      "id": "user-stefan",
+      "username": "Stefan1",
+      "fullName": "Stefan Petrović",
+      "role": "worker",
+      "password": "Stefan123",
+      "createdAt": "2026-10-05"
+    },
+    {
+      "id": "user-drasko",
+      "username": "Drasko1",
+      "fullName": "Draško Marković",
+      "role": "worker",
+      "password": "Drasko456",
+      "createdAt": "2026-10-10"
+    }
+  ],
+  "workOrders": [
+    {
+      "orderNumber": "RN-2026-002",
+      "customer": "fff",
+      "title": "fff",
+      "description": "fff",
+      "assignedWorkers": [
+        "Stefan1"
+      ],
+      "workerNotes": {},
+      "priority": "normalno",
+      "status": "priprema",
+      "dueDate": "2026-11-02",
+      "modelPreparation": {
+        "targetWorker": "Stefan1",
+        "targetWorkerName": "Stefan Petrović",
+        "isReady": false
+      },
+      "id": "wo-1793023071524-rp9wx",
+      "createdAt": "2026-10-26 14:57",
+      "createdBy": {
+        "username": "admin",
+        "fullName": "Administrator Radionice",
+        "timestamp": "2026-10-26 14:57"
+      },
+      "sastavnica": {
+        "status": "nije_napravljena"
+      }
+    },
+    {
+      "orderNumber": "RN-2026-001",
+      "customer": "ddd",
+      "title": "ddd",
+      "description": "ddd",
+      "assignedWorkers": [
+        "Stefan1"
+      ],
+      "workerNotes": {},
+      "priority": "normalno",
+      "status": "na_cekanju",
+      "dueDate": "2026-11-02",
+      "modelPreparation": {
+        "targetWorker": "Stefan1",
+        "targetWorkerName": "Stefan Petrović",
+        "isReady": true,
+        "readyAt": "2026-10-26 14:41",
+        "readyBy": "Administrator Radionice"
+      },
+      "id": "wo-1793022049563-djp79",
+      "createdAt": "2026-10-26 14:40",
+      "createdBy": {
+        "username": "admin",
+        "fullName": "Administrator Radionice",
+        "timestamp": "2026-10-26 14:40"
+      },
+      "sastavnica": {
+        "status": "nije_napravljena"
+      }
+    }
+  ],
+  "materials": [],
+  "consumptionLogs": [],
+  "deletedOrderIds": [
+    "wo-test-persistence-123"
+  ],
+  "version": 11,
+  "lastUpdated": "2026-10-28T07:51:25.464Z"
+}
