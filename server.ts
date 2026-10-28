@@ -55,6 +55,8 @@ interface ServerDatabase {
   materials: any[];
   consumptionLogs: any[];
   deletedOrderIds?: string[];
+  deletedMaterialIds?: string[];
+  deletedWorkerIds?: string[];
   version: number;
   lastUpdated: string;
 }
@@ -81,42 +83,370 @@ const cloneDb = (db: ServerDatabase): ServerDatabase => {
   return JSON.parse(JSON.stringify(db));
 };
 
-// Atomically save database to disk (temp file -> renameSync) + persistent backup
-function writeDatabase(db: ServerDatabase, eventType?: string): boolean {
+// Check whether a database snapshot holds any meaningful user records
+function hasDatabaseRecords(db: ServerDatabase | null | undefined): boolean {
+  if (!db || typeof db !== 'object') return false;
+  const hasOrders = Array.isArray(db.workOrders) && db.workOrders.length > 0;
+  const hasMaterials = Array.isArray(db.materials) && db.materials.length > 0;
+  const hasLogs = Array.isArray(db.consumptionLogs) && db.consumptionLogs.length > 0;
+  const hasCustomUsers = Array.isArray(db.users) && db.users.length > DEFAULT_SYSTEM_USERS.length;
+  return hasOrders || hasMaterials || hasLogs || hasCustomUsers;
+}
+
+// Helper to validate and sanitize any loaded database object
+function sanitizeLoadedDb(parsed: any): ServerDatabase | null {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+
+  const deletedOrderIds: string[] = Array.isArray(parsed.deletedOrderIds)
+    ? Array.from(new Set<string>(parsed.deletedOrderIds.filter(Boolean).map(String)))
+    : [];
+  const deletedMaterialIds: string[] = Array.isArray(parsed.deletedMaterialIds)
+    ? Array.from(new Set<string>(parsed.deletedMaterialIds.filter(Boolean).map(String)))
+    : [];
+  const deletedWorkerIds: string[] = Array.isArray(parsed.deletedWorkerIds)
+    ? Array.from(new Set<string>(parsed.deletedWorkerIds.filter(Boolean).map(String)))
+    : [];
+
+  const deletedWorkerSet = new Set(deletedWorkerIds);
+  const userMap = new Map<string, any>();
+  DEFAULT_SYSTEM_USERS.forEach((u) => userMap.set(u.id, u));
+  if (Array.isArray(parsed.users)) {
+    parsed.users.forEach((u: any) => {
+      if (u && u.id && (!deletedWorkerSet.has(u.id) || u.role === 'admin')) {
+        userMap.set(u.id, { ...userMap.get(u.id), ...u });
+      }
+    });
+  }
+  const sanitizedUsers = Array.from(userMap.values()).map((u) =>
+    u.username === 'admin' ? { ...u, password: 'admin123' } : u
+  );
+
+  const deletedOrderSet = new Set(deletedOrderIds);
+  const workOrders = Array.isArray(parsed.workOrders)
+    ? parsed.workOrders.filter((o: any) => o && o.id && !deletedOrderSet.has(o.id))
+    : [];
+
+  const deletedMatSet = new Set(deletedMaterialIds);
+  const materials = Array.isArray(parsed.materials)
+    ? parsed.materials.filter((m: any) => m && m.id && !deletedMatSet.has(m.id))
+    : [];
+
+  const consumptionLogs = Array.isArray(parsed.consumptionLogs)
+    ? parsed.consumptionLogs.filter((l: any) => l && l.id)
+    : [];
+
+  return {
+    users: sanitizedUsers,
+    workOrders,
+    materials,
+    consumptionLogs,
+    deletedOrderIds,
+    deletedMaterialIds,
+    deletedWorkerIds,
+    version: typeof parsed.version === 'number' ? parsed.version : 1,
+    lastUpdated: parsed.lastUpdated || new Date().toISOString(),
+  };
+}
+
+// Safely read and parse a JSON database file from disk
+function readDiskFile(filePath: string): ServerDatabase | null {
   try {
-    // 🛡️ ANTI-WIPE GUARD: Never allow overwriting non-empty workOrders with empty array!
-    if (memoryDb && Array.isArray(memoryDb.workOrders) && memoryDb.workOrders.length > 0) {
-      if (!Array.isArray(db.workOrders) || db.workOrders.length === 0) {
-        if (eventType !== 'db_reset') {
-          console.warn(`🛡️ [DB Guard] Blokirano resetovanje naloga na prazno! Zadržano ${memoryDb.workOrders.length} postojećih naloga.`);
-          db.workOrders = cloneDb(memoryDb).workOrders;
-        }
+    if (!fs.existsSync(filePath)) return null;
+    const content = fs.readFileSync(filePath, 'utf-8').trim();
+    if (!content) return null;
+    return sanitizeLoadedDb(JSON.parse(content));
+  } catch (err) {
+    console.warn(`⚠️ [DB Engine] Greška pri čitanju fajla ${path.basename(filePath)}:`, err);
+    return null;
+  }
+}
+
+// Non-destructively merge two database snapshots while respecting explicit deletion tombstones
+function mergeDatabases(baseDb: ServerDatabase, newerDb: ServerDatabase): ServerDatabase {
+  const deletedOrderIds = Array.from(
+    new Set([...(baseDb.deletedOrderIds || []), ...(newerDb.deletedOrderIds || [])].filter(Boolean))
+  );
+  const deletedMaterialIds = Array.from(
+    new Set([...(baseDb.deletedMaterialIds || []), ...(newerDb.deletedMaterialIds || [])].filter(Boolean))
+  );
+  const deletedWorkerIds = Array.from(
+    new Set([...(baseDb.deletedWorkerIds || []), ...(newerDb.deletedWorkerIds || [])].filter(Boolean))
+  );
+
+  const deletedOrderSet = new Set(deletedOrderIds);
+  const deletedMatSet = new Set(deletedMaterialIds);
+  const deletedWorkerSet = new Set(deletedWorkerIds);
+
+  // 1. Merge Users
+  const userMap = new Map<string, any>();
+  DEFAULT_SYSTEM_USERS.forEach((u) => userMap.set(u.id, u));
+  (baseDb.users || []).forEach((u) => {
+    if (u && u.id && (!deletedWorkerSet.has(u.id) || u.role === 'admin')) {
+      userMap.set(u.id, u);
+    }
+  });
+  (newerDb.users || []).forEach((u) => {
+    if (u && u.id && (!deletedWorkerSet.has(u.id) || u.role === 'admin')) {
+      userMap.set(u.id, { ...userMap.get(u.id), ...u });
+    }
+  });
+  const users = Array.from(userMap.values()).map((u) =>
+    u.username === 'admin' ? { ...u, password: 'admin123' } : u
+  );
+
+  // 2. Merge Work Orders (keep newerDb order priority, preserve any missing from baseDb)
+  const orderMap = new Map<string, any>();
+  (newerDb.workOrders || []).forEach((o) => {
+    if (o && o.id && !deletedOrderSet.has(o.id)) {
+      orderMap.set(o.id, o);
+    }
+  });
+  (baseDb.workOrders || []).forEach((o) => {
+    if (o && o.id && !deletedOrderSet.has(o.id)) {
+      if (orderMap.has(o.id)) {
+        orderMap.set(o.id, { ...o, ...orderMap.get(o.id) });
+      } else {
+        orderMap.set(o.id, o);
       }
     }
+  });
+  const workOrders = Array.from(orderMap.values());
 
-    db.version = (db.version || 0) + 1;
+  // 3. Merge Materials
+  const matMap = new Map<string, any>();
+  (newerDb.materials || []).forEach((m) => {
+    if (m && m.id && !deletedMatSet.has(m.id)) {
+      matMap.set(m.id, m);
+    }
+  });
+  (baseDb.materials || []).forEach((m) => {
+    if (m && m.id && !deletedMatSet.has(m.id)) {
+      if (matMap.has(m.id)) {
+        matMap.set(m.id, { ...m, ...matMap.get(m.id) });
+      } else {
+        matMap.set(m.id, m);
+      }
+    }
+  });
+  const materials = Array.from(matMap.values());
+
+  // 4. Merge Consumption Logs
+  const logMap = new Map<string, any>();
+  (newerDb.consumptionLogs || []).forEach((l) => {
+    if (l && l.id) logMap.set(l.id, l);
+  });
+  (baseDb.consumptionLogs || []).forEach((l) => {
+    if (l && l.id) {
+      if (logMap.has(l.id)) {
+        logMap.set(l.id, { ...l, ...logMap.get(l.id) });
+      } else {
+        logMap.set(l.id, l);
+      }
+    }
+  });
+  const consumptionLogs = Array.from(logMap.values());
+
+  return {
+    users,
+    workOrders,
+    materials,
+    consumptionLogs,
+    deletedOrderIds,
+    deletedMaterialIds,
+    deletedWorkerIds,
+    version: Math.max(baseDb.version || 1, newerDb.version || 1),
+    lastUpdated: newerDb.lastUpdated || baseDb.lastUpdated || new Date().toISOString(),
+  };
+}
+
+// Raw atomic file writer helper
+function writeJsonFileAtomically(targetPath: string, data: ServerDatabase): void {
+  const serialized = JSON.stringify(data, null, 2);
+  const tmpFile = `${targetPath}.tmp.${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+  fs.writeFileSync(tmpFile, serialized, 'utf-8');
+  fs.renameSync(tmpFile, targetPath);
+}
+
+// Atomically save database to disk (temp file -> renameSync) + persistent backup with strict Anti-Wipe Guard
+function writeDatabase(db: ServerDatabase, eventType?: string): boolean {
+  try {
+    if (!db || typeof db !== 'object') {
+      console.warn('🛡️ [Anti-Wipe Guard] Odbijen upis nevalidnog (null/empty) objekta baze.');
+      return false;
+    }
+
+    // Load authoritative existing state from memory + disk (primary & backup) to prevent any accidental wipe
+    let existingDb: ServerDatabase | null = memoryDb ? cloneDb(memoryDb) : null;
+    const diskPrimary = readDiskFile(DB_FILE);
+    const diskBackup = readDiskFile(DB_BACKUP_FILE);
+
+    if (diskBackup) {
+      existingDb = existingDb ? mergeDatabases(diskBackup, existingDb) : diskBackup;
+    }
+    if (diskPrimary) {
+      existingDb = existingDb ? mergeDatabases(diskPrimary, existingDb) : diskPrimary;
+    }
+
+    // Ensure arrays exist on incoming db
+    db.deletedOrderIds = Array.isArray(db.deletedOrderIds) ? db.deletedOrderIds : [];
+    db.deletedMaterialIds = Array.isArray(db.deletedMaterialIds) ? db.deletedMaterialIds : [];
+    db.deletedWorkerIds = Array.isArray(db.deletedWorkerIds) ? db.deletedWorkerIds : [];
+
+    if (existingDb && eventType !== 'db_admin_reset') {
+      // Combine tombstones unless an item is explicitly being re-created right now
+      const activeIdsBeingWritten = new Set([
+        ...(Array.isArray(db.workOrders) ? db.workOrders.map((o: any) => o?.id) : []),
+        ...(Array.isArray(db.materials) ? db.materials.map((m: any) => m?.id) : []),
+        ...(Array.isArray(db.users) ? db.users.map((u: any) => u?.id) : []),
+      ].filter(Boolean));
+
+      const mergedDeletedOrders = new Set([
+        ...(existingDb.deletedOrderIds || []),
+        ...(db.deletedOrderIds || []),
+      ]);
+      activeIdsBeingWritten.forEach((id) => mergedDeletedOrders.delete(id));
+      db.deletedOrderIds = Array.from(mergedDeletedOrders);
+
+      const mergedDeletedMaterials = new Set([
+        ...(existingDb.deletedMaterialIds || []),
+        ...(db.deletedMaterialIds || []),
+      ]);
+      activeIdsBeingWritten.forEach((id) => mergedDeletedMaterials.delete(id));
+      db.deletedMaterialIds = Array.from(mergedDeletedMaterials);
+
+      const mergedDeletedWorkers = new Set([
+        ...(existingDb.deletedWorkerIds || []),
+        ...(db.deletedWorkerIds || []),
+      ]);
+      activeIdsBeingWritten.forEach((id) => mergedDeletedWorkers.delete(id));
+      db.deletedWorkerIds = Array.from(mergedDeletedWorkers);
+
+      const survivingExistingOrders = (existingDb.workOrders || []).filter(
+        (o: any) => o && o.id && !mergedDeletedOrders.has(o.id)
+      );
+      const survivingExistingMaterials = (existingDb.materials || []).filter(
+        (m: any) => m && m.id && !mergedDeletedMaterials.has(m.id)
+      );
+      const survivingExistingLogs = existingDb.consumptionLogs || [];
+
+      // 🛡️ 1. STRICT ANTI-WIPE GUARD FOR WORK ORDERS
+      if (survivingExistingOrders.length > 0 && (!Array.isArray(db.workOrders) || db.workOrders.length === 0)) {
+        console.warn(
+          `🛡️ [Anti-Wipe Guard] Blokiran pokušaj brisanja radnih naloga praznom listom (event: ${eventType})! Zadržano ${survivingExistingOrders.length} postojećih naloga.`
+        );
+        db.workOrders = cloneDb(existingDb).workOrders.filter(
+          (o: any) => o && o.id && !mergedDeletedOrders.has(o.id)
+        );
+      } else {
+        // Non-destructively preserve all non-deleted existing orders alongside incoming orders
+        const orderMap = new Map<string, any>();
+        (Array.isArray(db.workOrders) ? db.workOrders : []).forEach((o: any) => {
+          if (o && o.id && !mergedDeletedOrders.has(o.id)) {
+            orderMap.set(o.id, o);
+          }
+        });
+        survivingExistingOrders.forEach((o: any) => {
+          if (o && o.id && !mergedDeletedOrders.has(o.id)) {
+            if (orderMap.has(o.id)) {
+              orderMap.set(o.id, { ...o, ...orderMap.get(o.id) });
+            } else {
+              orderMap.set(o.id, o);
+            }
+          }
+        });
+        db.workOrders = Array.from(orderMap.values());
+      }
+
+      // 🛡️ 2. STRICT ANTI-WIPE GUARD FOR MATERIALS (MAGACIN)
+      if (survivingExistingMaterials.length > 0 && (!Array.isArray(db.materials) || db.materials.length === 0)) {
+        console.warn(
+          `🛡️ [Anti-Wipe Guard] Blokiran pokušaj brisanja magacina praznom listom (event: ${eventType})! Zadržano ${survivingExistingMaterials.length} postojećih materijala.`
+        );
+        db.materials = cloneDb(existingDb).materials.filter(
+          (m: any) => m && m.id && !mergedDeletedMaterials.has(m.id)
+        );
+      } else {
+        const matMap = new Map<string, any>();
+        (Array.isArray(db.materials) ? db.materials : []).forEach((m: any) => {
+          if (m && m.id && !mergedDeletedMaterials.has(m.id)) {
+            matMap.set(m.id, m);
+          }
+        });
+        survivingExistingMaterials.forEach((m: any) => {
+          if (m && m.id && !mergedDeletedMaterials.has(m.id)) {
+            if (matMap.has(m.id)) {
+              matMap.set(m.id, { ...m, ...matMap.get(m.id) });
+            } else {
+              matMap.set(m.id, m);
+            }
+          }
+        });
+        db.materials = Array.from(matMap.values());
+      }
+
+      // 🛡️ 3. STRICT ANTI-WIPE GUARD FOR CONSUMPTION LOGS (TROŠKOVI)
+      if (survivingExistingLogs.length > 0 && (!Array.isArray(db.consumptionLogs) || db.consumptionLogs.length === 0)) {
+        console.warn(
+          `🛡️ [Anti-Wipe Guard] Blokiran pokušaj brisanja troškova/utroška praznom listom (event: ${eventType})! Zadržano ${survivingExistingLogs.length} zapisa.`
+        );
+        db.consumptionLogs = cloneDb(existingDb).consumptionLogs;
+      } else {
+        const logMap = new Map<string, any>();
+        (Array.isArray(db.consumptionLogs) ? db.consumptionLogs : []).forEach((l: any) => {
+          if (l && l.id) logMap.set(l.id, l);
+        });
+        survivingExistingLogs.forEach((l: any) => {
+          if (l && l.id) {
+            if (logMap.has(l.id)) {
+              logMap.set(l.id, { ...l, ...logMap.get(l.id) });
+            } else {
+              logMap.set(l.id, l);
+            }
+          }
+        });
+        db.consumptionLogs = Array.from(logMap.values());
+      }
+
+      // 🛡️ 4. STRICT ANTI-WIPE GUARD FOR USERS / WORKERS
+      const userMap = new Map<string, any>();
+      DEFAULT_SYSTEM_USERS.forEach((u) => userMap.set(u.id, u));
+      (existingDb.users || []).forEach((u: any) => {
+        if (u && u.id && (!mergedDeletedWorkers.has(u.id) || u.role === 'admin')) {
+          userMap.set(u.id, u);
+        }
+      });
+      (Array.isArray(db.users) ? db.users : []).forEach((u: any) => {
+        if (u && u.id && (!mergedDeletedWorkers.has(u.id) || u.role === 'admin')) {
+          userMap.set(u.id, { ...userMap.get(u.id), ...u });
+        }
+      });
+      db.users = Array.from(userMap.values()).map((u) =>
+        u.username === 'admin' ? { ...u, password: 'admin123' } : u
+      );
+    }
+
+    db.version = Math.max(db.version || 0, existingDb?.version || 0) + 1;
     db.lastUpdated = new Date().toISOString();
 
     // 1. Immediately update in-memory state
     memoryDb = cloneDb(db);
 
-    // 2. Atomic disk write via unique temporary file (prevents empty/corrupt reads)
-    const serialized = JSON.stringify(db, null, 2);
-    const tmpFile = `${DB_FILE}.tmp.${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
-    fs.writeFileSync(tmpFile, serialized, 'utf-8');
-    fs.renameSync(tmpFile, DB_FILE);
+    // 2. Atomic disk write to primary server-db.json
+    writeJsonFileAtomically(DB_FILE, memoryDb);
 
-    // 3. Keep persistent backup whenever workOrders or materials exist
-    if ((db.workOrders && db.workOrders.length > 0) || (db.materials && db.materials.length > 0)) {
+    // 3. Keep persistent backup (server-db.backup.json) updated whenever records exist or explicit delete tombstones are added
+    const isExplicitDelete =
+      eventType === 'work_order_deleted' ||
+      eventType === 'material_deleted' ||
+      eventType === 'worker_deleted';
+
+    if (hasDatabaseRecords(memoryDb) || isExplicitDelete) {
       try {
-        fs.writeFileSync(DB_BACKUP_FILE, serialized, 'utf-8');
+        writeJsonFileAtomically(DB_BACKUP_FILE, memoryDb);
       } catch (backupErr) {
         console.warn('⚠️ [DB Engine] Backup write warning:', backupErr);
       }
     }
-
-    // Notice: Automatic external network sync (Google Sheets/Git) is deliberately DISABLED here.
-    // All order and warehouse operations are stored locally and atomically to avoid Quota Exceeded errors.
 
     // 4. Broadcast updated authoritative database to all connected phones & computers in real time
     broadcastDatabaseUpdate(memoryDb);
@@ -128,104 +458,101 @@ function writeDatabase(db: ServerDatabase, eventType?: string): boolean {
   }
 }
 
-// Helper to validate and sanitize any loaded database object
-function sanitizeLoadedDb(parsed: any): ServerDatabase | null {
-  if (!parsed || typeof parsed !== 'object') return null;
-
-  const userMap = new Map<string, any>();
-  DEFAULT_SYSTEM_USERS.forEach((u) => userMap.set(u.id, u));
-  if (Array.isArray(parsed.users)) {
-    parsed.users.forEach((u: any) => {
-      if (u && u.id) userMap.set(u.id, { ...userMap.get(u.id), ...u });
-    });
-  }
-  const sanitizedUsers = Array.from(userMap.values()).map((u) =>
-    u.username === 'admin' ? { ...u, password: 'admin123' } : u
-  );
-
-  const workOrders = Array.isArray(parsed.workOrders) ? parsed.workOrders : [];
-  const materials = Array.isArray(parsed.materials) ? parsed.materials : [];
-  const consumptionLogs = Array.isArray(parsed.consumptionLogs) ? parsed.consumptionLogs : [];
-  const deletedOrderIds = Array.isArray(parsed.deletedOrderIds) ? parsed.deletedOrderIds : [];
-
-  return {
-    users: sanitizedUsers,
-    workOrders,
-    materials,
-    consumptionLogs,
-    deletedOrderIds,
-    version: typeof parsed.version === 'number' ? parsed.version : 1,
-    lastUpdated: parsed.lastUpdated || new Date().toISOString(),
-  };
-}
-
-// Safely load database without ever wiping existing records
+// Safely load database without ever wiping existing records, with automatic restore from server-db.backup.json
 function readDatabase(): ServerDatabase {
-  if (memoryDb && Array.isArray(memoryDb.workOrders)) {
+  // Always inspect disk files if memoryDb is not initialized OR if memoryDb appears empty
+  if (memoryDb && hasDatabaseRecords(memoryDb)) {
     return cloneDb(memoryDb);
   }
 
-  // 1. Try reading primary DB_FILE
-  let primaryDb: ServerDatabase | null = null;
-  try {
-    if (fs.existsSync(DB_FILE)) {
-      const content = fs.readFileSync(DB_FILE, 'utf-8').trim();
-      if (content) {
-        primaryDb = sanitizeLoadedDb(JSON.parse(content));
-      }
+  // 1. Read primary server-db.json and backup server-db.backup.json
+  const primaryDb = readDiskFile(DB_FILE);
+  const backupDb = readDiskFile(DB_BACKUP_FILE);
+
+  const primaryHasData = hasDatabaseRecords(primaryDb);
+  const backupHasData = hasDatabaseRecords(backupDb);
+
+  // 2. Automatic Recovery if primary server-db.json is missing, corrupt, or empty while backup has data
+  if (!primaryHasData && backupHasData && backupDb) {
+    console.warn(
+      `🔄 [Auto-Recovery] Glavni fajl server-db.json je prazan ili oštećen! Automatsko vraćanje podataka iz rezervne kopije (server-db.backup.json): ${backupDb.workOrders.length} naloga, ${backupDb.materials.length} materijala.`
+    );
+    memoryDb = cloneDb(backupDb);
+    try {
+      writeJsonFileAtomically(DB_FILE, memoryDb);
+    } catch (err) {
+      console.warn('⚠️ [Auto-Recovery] Greška pri upisu vraćene baze u server-db.json:', err);
     }
-  } catch (err) {
-    console.warn('⚠️ [DB Engine] Greška pri čitanju DB_FILE:', err);
+    return cloneDb(memoryDb);
   }
 
-  // 2. Try reading BACKUP_FILE
-  let backupDb: ServerDatabase | null = null;
-  try {
-    if (fs.existsSync(DB_BACKUP_FILE)) {
-      const backupContent = fs.readFileSync(DB_BACKUP_FILE, 'utf-8').trim();
-      if (backupContent) {
-        backupDb = sanitizeLoadedDb(JSON.parse(backupContent));
-      }
-    }
-  } catch (err) {
-    console.warn('⚠️ [DB Engine] Greška pri čitanju backup fajla:', err);
-  }
-
-  // 3. Multi-tier non-destructive merge: always keep whichever has existing orders
-  let chosenDb: ServerDatabase | null = null;
+  // 3. If both primary and backup exist, non-destructively merge them so no record from either is ever lost
   if (primaryDb && backupDb) {
-    if (backupDb.workOrders.length > primaryDb.workOrders.length) {
-      console.log(`🛡️ [DB Engine] Backup ima više naloga (${backupDb.workOrders.length}) od primarnog fajla (${primaryDb.workOrders.length}). Spajanje...`);
-      const orderMap = new Map<string, any>();
-      backupDb.workOrders.forEach((o) => { if (o && o.id) orderMap.set(o.id, o); });
-      primaryDb.workOrders.forEach((o) => { if (o && o.id) orderMap.set(o.id, { ...orderMap.get(o.id), ...o }); });
-      primaryDb.workOrders = Array.from(orderMap.values());
-    }
-    chosenDb = primaryDb;
-  } else if (primaryDb) {
-    chosenDb = primaryDb;
-  } else if (backupDb) {
-    chosenDb = backupDb;
-  }
+    const mergedDb = mergeDatabases(backupDb, primaryDb);
+    const recoveredOrders = mergedDb.workOrders.length > primaryDb.workOrders.length;
+    const recoveredMaterials = mergedDb.materials.length > primaryDb.materials.length;
+    const recoveredLogs = mergedDb.consumptionLogs.length > primaryDb.consumptionLogs.length;
 
-  if (chosenDb) {
-    memoryDb = chosenDb;
+    memoryDb = mergedDb;
+
+    if (recoveredOrders || recoveredMaterials || recoveredLogs) {
+      console.log(
+        `🛡️ [Auto-Recovery Merge] Dopunjeni podaci iz server-db.backup.json u server-db.json (Nalozi: ${mergedDb.workOrders.length}, Materijali: ${mergedDb.materials.length}, Troškovi: ${mergedDb.consumptionLogs.length}).`
+      );
+      try {
+        writeJsonFileAtomically(DB_FILE, memoryDb);
+        writeJsonFileAtomically(DB_BACKUP_FILE, memoryDb);
+      } catch {}
+    } else if (primaryHasData && !backupHasData) {
+      // Ensure backup is populated if primary has data and backup was empty
+      try {
+        writeJsonFileAtomically(DB_BACKUP_FILE, memoryDb);
+      } catch {}
+    }
+
     return cloneDb(memoryDb);
   }
 
-  // 4. Fallback only if absolutely no database files exist on disk
+  if (primaryDb) {
+    memoryDb = primaryDb;
+    if (primaryHasData) {
+      try {
+        writeJsonFileAtomically(DB_BACKUP_FILE, memoryDb);
+      } catch {}
+    }
+    return cloneDb(memoryDb);
+  }
+
+  if (backupDb) {
+    console.warn('🔄 [Auto-Recovery] Vraćanje baze iz server-db.backup.json...');
+    memoryDb = backupDb;
+    try {
+      writeJsonFileAtomically(DB_FILE, memoryDb);
+    } catch {}
+    return cloneDb(memoryDb);
+  }
+
+  // 4. Fallback ONLY if neither server-db.json nor server-db.backup.json exists on disk
+  if (memoryDb) {
+    return cloneDb(memoryDb);
+  }
+
   const initialDb: ServerDatabase = {
     users: DEFAULT_SYSTEM_USERS,
     workOrders: [],
     materials: [],
     consumptionLogs: [],
     deletedOrderIds: [],
+    deletedMaterialIds: [],
+    deletedWorkerIds: [],
     version: 1,
     lastUpdated: new Date().toISOString(),
   };
 
   memoryDb = initialDb;
-  writeDatabase(memoryDb, 'initial_setup');
+  try {
+    writeJsonFileAtomically(DB_FILE, memoryDb);
+  } catch {}
   return cloneDb(memoryDb);
 }
 
@@ -483,29 +810,67 @@ async function startServer() {
     res.json(db);
   });
 
-  // 2. Full synchronization endpoint - Safe non-destructive merge
+  // 2. Full synchronization endpoint - Safe non-destructive merge with Anti-Wipe Guard
   app.post('/api/sync', (req: Request, res: Response) => {
-    const { users, workOrders, materials, consumptionLogs, deletedOrderIds } = req.body;
+    if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) {
+      const currentDb = readDatabase();
+      return res.json({ success: true, db: currentDb, ignoredEmptyPayload: true });
+    }
+
+    const { users, workOrders, materials, consumptionLogs, deletedOrderIds, deletedMaterialIds, deletedWorkerIds } = req.body;
     const db = readDatabase();
 
+    // Anti-Wipe Guard: If all payload arrays are empty or missing, never touch or overwrite existing database
+    const hasIncomingOrders = Array.isArray(workOrders) && workOrders.length > 0;
+    const hasIncomingMaterials = Array.isArray(materials) && materials.length > 0;
+    const hasIncomingLogs = Array.isArray(consumptionLogs) && consumptionLogs.length > 0;
+    const hasIncomingUsers = Array.isArray(users) && users.length > 0;
+    const hasIncomingTombstones =
+      (Array.isArray(deletedOrderIds) && deletedOrderIds.length > 0) ||
+      (Array.isArray(deletedMaterialIds) && deletedMaterialIds.length > 0) ||
+      (Array.isArray(deletedWorkerIds) && deletedWorkerIds.length > 0);
+
+    if (!hasIncomingOrders && !hasIncomingMaterials && !hasIncomingLogs && !hasIncomingUsers && !hasIncomingTombstones) {
+      return res.json({ success: true, db, ignoredEmptyPayload: true });
+    }
+
     // Merge deleted order IDs tombstones
-    if (Array.isArray(deletedOrderIds)) {
+    if (Array.isArray(deletedOrderIds) && deletedOrderIds.length > 0) {
       const tombstoneSet = new Set(db.deletedOrderIds || []);
       deletedOrderIds.forEach((id: string) => { if (id) tombstoneSet.add(id); });
       db.deletedOrderIds = Array.from(tombstoneSet);
     }
+    if (Array.isArray(deletedMaterialIds) && deletedMaterialIds.length > 0) {
+      const matTombstoneSet = new Set(db.deletedMaterialIds || []);
+      deletedMaterialIds.forEach((id: string) => { if (id) matTombstoneSet.add(id); });
+      db.deletedMaterialIds = Array.from(matTombstoneSet);
+    }
+    if (Array.isArray(deletedWorkerIds) && deletedWorkerIds.length > 0) {
+      const workerTombstoneSet = new Set(db.deletedWorkerIds || []);
+      deletedWorkerIds.forEach((id: string) => { if (id) workerTombstoneSet.add(id); });
+      db.deletedWorkerIds = Array.from(workerTombstoneSet);
+    }
+
     const currentDeletedSet = new Set(db.deletedOrderIds || []);
+    const currentDeletedMatSet = new Set(db.deletedMaterialIds || []);
+    const currentDeletedWorkerSet = new Set(db.deletedWorkerIds || []);
 
     const isSyncTombstoned = (o: any) => {
       if (!o || !o.id) return false;
       return currentDeletedSet.has(o.id);
     };
 
-    if (Array.isArray(users) && users.length > 0) {
+    if (hasIncomingUsers) {
       const userMap = new Map<string, any>();
       DEFAULT_SYSTEM_USERS.forEach((u) => userMap.set(u.id, u));
-      (db.users || []).forEach((u) => { if (u?.id) userMap.set(u.id, u); });
-      users.forEach((u: any) => { if (u?.id) userMap.set(u.id, { ...userMap.get(u.id), ...u }); });
+      (db.users || []).forEach((u) => {
+        if (u?.id && (!currentDeletedWorkerSet.has(u.id) || u.role === 'admin')) userMap.set(u.id, u);
+      });
+      users.forEach((u: any) => {
+        if (u?.id && (!currentDeletedWorkerSet.has(u.id) || u.role === 'admin')) {
+          userMap.set(u.id, { ...userMap.get(u.id), ...u });
+        }
+      });
       db.users = Array.from(userMap.values());
     }
 
@@ -518,7 +883,7 @@ async function startServer() {
       }
     });
 
-    if (Array.isArray(workOrders) && workOrders.length > 0) {
+    if (hasIncomingOrders) {
       workOrders.forEach((o: any) => {
         if (o && o.id && !isSyncTombstoned(o)) {
           const existing = orderMap.get(o.id);
@@ -529,17 +894,23 @@ async function startServer() {
 
     db.workOrders = Array.from(orderMap.values());
 
-    if (Array.isArray(materials) && materials.length > 0) {
+    if (hasIncomingMaterials) {
       const matMap = new Map<string, any>();
-      (db.materials || []).forEach((m) => { if (m?.id) matMap.set(m.id, m); });
-      materials.forEach((m: any) => { if (m?.id) matMap.set(m.id, { ...matMap.get(m.id), ...m }); });
+      (db.materials || []).forEach((m) => {
+        if (m?.id && !currentDeletedMatSet.has(m.id)) matMap.set(m.id, m);
+      });
+      materials.forEach((m: any) => {
+        if (m?.id && !currentDeletedMatSet.has(m.id)) {
+          matMap.set(m.id, { ...matMap.get(m.id), ...m });
+        }
+      });
       db.materials = Array.from(matMap.values());
     }
 
-    if (Array.isArray(consumptionLogs) && consumptionLogs.length > 0) {
+    if (hasIncomingLogs) {
       const logMap = new Map<string, any>();
       (db.consumptionLogs || []).forEach((l) => { if (l?.id) logMap.set(l.id, l); });
-      consumptionLogs.forEach((l: any) => { if (l?.id) logMap.set(l.id, l); });
+      consumptionLogs.forEach((l: any) => { if (l?.id) logMap.set(l.id, { ...logMap.get(l.id), ...l }); });
       db.consumptionLogs = Array.from(logMap.values());
     }
 
@@ -550,7 +921,7 @@ async function startServer() {
   // 3. Work Orders - Unlimited persistent storage (Safe additive merge)
   app.post('/api/work-orders', (req: Request, res: Response) => {
     const newOrder = req.body;
-    if (!newOrder || !newOrder.orderNumber || !newOrder.title) {
+    if (!newOrder || typeof newOrder !== 'object' || Array.isArray(newOrder) || !newOrder.orderNumber || !newOrder.title) {
       return res.status(400).json({ success: false, error: 'Broj naloga i naziv su obavezni.' });
     }
 
@@ -603,6 +974,10 @@ async function startServer() {
   app.put('/api/work-orders/:id', (req: Request, res: Response) => {
     const { id } = req.params;
     const updates = req.body;
+    if (!updates || typeof updates !== 'object' || Array.isArray(updates) || Object.keys(updates).length === 0) {
+      return res.status(400).json({ success: false, error: 'Podaci za izmjenu naloga ne mogu biti prazni.' });
+    }
+
     const db = readDatabase();
 
     const idx = db.workOrders.findIndex(o => o.id === id);
@@ -625,7 +1000,7 @@ async function startServer() {
       }
     }
 
-    db.workOrders[idx] = { ...db.workOrders[idx], ...updates };
+    db.workOrders[idx] = { ...db.workOrders[idx], ...updates, id };
     writeDatabase(db, 'work_order_updated');
     res.json({ success: true, workOrder: db.workOrders[idx], workOrders: db.workOrders, db });
   });
@@ -633,6 +1008,10 @@ async function startServer() {
   app.delete('/api/work-orders/:id', (req: Request, res: Response) => {
     const rawId = req.params.id;
     const id = decodeURIComponent(rawId);
+    if (!id) {
+      return res.status(400).json({ success: false, error: 'ID naloga je obavezan.' });
+    }
+
     const db = readDatabase();
 
     const found = (db.workOrders || []).find((o: any) => o.id === id || o.id === rawId);
@@ -662,8 +1041,16 @@ async function startServer() {
   // 4. Materials
   app.post('/api/materials', (req: Request, res: Response) => {
     const newMaterial = req.body;
+    if (!newMaterial || typeof newMaterial !== 'object' || Array.isArray(newMaterial) || !newMaterial.id || !newMaterial.name) {
+      return res.status(400).json({ success: false, error: 'Nevalidni podaci materijala.' });
+    }
+
     const db = readDatabase();
     if (!Array.isArray(db.materials)) db.materials = [];
+    if (Array.isArray(db.deletedMaterialIds)) {
+      db.deletedMaterialIds = db.deletedMaterialIds.filter((mId) => mId !== newMaterial.id);
+    }
+
     const existingIdx = db.materials.findIndex(m => m.id === newMaterial.id);
     if (existingIdx >= 0) {
       db.materials[existingIdx] = { ...db.materials[existingIdx], ...newMaterial };
@@ -677,10 +1064,14 @@ async function startServer() {
   app.put('/api/materials/:id', (req: Request, res: Response) => {
     const { id } = req.params;
     const updates = req.body;
+    if (!updates || typeof updates !== 'object' || Array.isArray(updates) || Object.keys(updates).length === 0) {
+      return res.status(400).json({ success: false, error: 'Prazni podaci za izmjenu materijala.' });
+    }
+
     const db = readDatabase();
     const idx = db.materials.findIndex(m => m.id === id);
     if (idx !== -1) {
-      db.materials[idx] = { ...db.materials[idx], ...updates };
+      db.materials[idx] = { ...db.materials[idx], ...updates, id };
       writeDatabase(db, 'material_updated');
     }
     res.json({ success: true, materials: db.materials, db });
@@ -688,16 +1079,35 @@ async function startServer() {
 
   app.delete('/api/materials/:id', (req: Request, res: Response) => {
     const { id } = req.params;
+    if (!id) {
+      return res.status(400).json({ success: false, error: 'ID materijala je obavezan.' });
+    }
+
     const db = readDatabase();
-    db.materials = db.materials.filter(m => m.id !== id);
+    db.materials = (db.materials || []).filter(m => m.id !== id);
+    if (!Array.isArray(db.deletedMaterialIds)) {
+      db.deletedMaterialIds = [];
+    }
+    if (!db.deletedMaterialIds.includes(id)) {
+      db.deletedMaterialIds.push(id);
+    }
+
     writeDatabase(db, 'material_deleted');
-    res.json({ success: true, materials: db.materials, db });
+    res.json({ success: true, materials: db.materials, deletedMaterialIds: db.deletedMaterialIds, db });
   });
 
   // 5. Workers
   app.post('/api/workers', (req: Request, res: Response) => {
     const newWorker = req.body;
+    if (!newWorker || typeof newWorker !== 'object' || Array.isArray(newWorker) || !newWorker.username) {
+      return res.status(400).json({ success: false, error: 'Nevalidni podaci radnika.' });
+    }
+
     const db = readDatabase();
+    if (Array.isArray(db.deletedWorkerIds) && newWorker.id) {
+      db.deletedWorkerIds = db.deletedWorkerIds.filter((wId) => wId !== newWorker.id);
+    }
+
     const exists = db.users.some(u => u.username.toLowerCase() === newWorker.username.toLowerCase());
     if (exists) {
       return res.status(400).json({ success: false, error: 'Korisničko ime već postoji.' });
@@ -710,10 +1120,14 @@ async function startServer() {
   app.put('/api/workers/:id', (req: Request, res: Response) => {
     const { id } = req.params;
     const updates = req.body;
+    if (!updates || typeof updates !== 'object' || Array.isArray(updates) || Object.keys(updates).length === 0) {
+      return res.status(400).json({ success: false, error: 'Prazni podaci za izmjenu radnika.' });
+    }
+
     const db = readDatabase();
     const idx = db.users.findIndex(u => u.id === id);
     if (idx !== -1) {
-      db.users[idx] = { ...db.users[idx], ...updates };
+      db.users[idx] = { ...db.users[idx], ...updates, id };
       writeDatabase(db, 'worker_updated');
     }
     res.json({ success: true, users: db.users, db });
@@ -722,13 +1136,28 @@ async function startServer() {
   app.delete('/api/workers/:id', (req: Request, res: Response) => {
     const { id } = req.params;
     const db = readDatabase();
-    db.users = db.users.filter(u => u.id !== id);
+    const target = (db.users || []).find(u => u.id === id);
+    if (target?.role === 'admin' || id === 'user-admin') {
+      return res.status(400).json({ success: false, error: 'Glavni administrator se ne može obrisati.' });
+    }
+
+    db.users = (db.users || []).filter(u => u.id !== id);
+    if (!Array.isArray(db.deletedWorkerIds)) {
+      db.deletedWorkerIds = [];
+    }
+    if (id && !db.deletedWorkerIds.includes(id)) {
+      db.deletedWorkerIds.push(id);
+    }
+
     writeDatabase(db, 'worker_deleted');
-    res.json({ success: true, users: db.users, db });
+    res.json({ success: true, users: db.users, deletedWorkerIds: db.deletedWorkerIds, db });
   });
 
   // 6. Consumption & Completion Logging
   app.post('/api/consumption', (req: Request, res: Response) => {
+    if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) {
+      return res.status(400).json({ success: false, error: 'Nevalidni podaci utroška.' });
+    }
     const { logs, workOrderId, closedBy, status } = req.body;
     const db = readDatabase();
 
@@ -966,17 +1395,26 @@ async function startServer() {
     }
   });
 
-  // Reset to default
+  // Reset to default - Protected by Anti-Wipe Guard unless explicitly confirmed by Admin
   app.post('/api/reset', (req: Request, res: Response) => {
+    if (!req.body || req.body.confirmAdminReset !== true || req.body.role !== 'admin') {
+      console.warn('🛡️ [Anti-Wipe Guard] Odbijen neautorizovan poziv na /api/reset. Postojeći podaci zadržani.');
+      const currentDb = readDatabase();
+      return res.json({ success: false, db: currentDb });
+    }
+
     const initialDb: ServerDatabase = {
       users: DEFAULT_SYSTEM_USERS,
       workOrders: [],
       materials: [],
       consumptionLogs: [],
+      deletedOrderIds: [],
+      deletedMaterialIds: [],
+      deletedWorkerIds: [],
       version: 1,
       lastUpdated: new Date().toISOString(),
     };
-    writeDatabase(initialDb, 'db_reset');
+    writeDatabase(initialDb, 'db_admin_reset');
     res.json({ success: true, db: initialDb });
   });
 

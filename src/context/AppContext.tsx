@@ -73,22 +73,39 @@ const LEGACY_DATA_KEYS = [
   'rn_current_user_v5',
 ];
 
+const SESSION_USER_KEY = 'rn_session_auth_user_v6';
+
 const AppContext = createContext<AppContextType | undefined>(undefined);
 
 export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  // Purge any old localStorage caches on mount so Phone & Desktop strictly use server-db.json
+  // Purge any old localStorage data caches on mount so Phone & Desktop strictly use server-db.json
   useEffect(() => {
     try {
       LEGACY_DATA_KEYS.forEach((key) => localStorage.removeItem(key));
     } catch {}
   }, []);
 
-  // Authoritative tombstone set from server-db.json
+  // Authoritative tombstone sets from server-db.json
   const deletedOrdersRef = useRef<Set<string>>(new Set<string>());
+  const deletedMaterialsRef = useRef<Set<string>>(new Set<string>());
+  const deletedWorkersRef = useRef<Set<string>>(new Set<string>());
+
+  // Track server version & active mutations so stale background polls never overwrite newer state
+  const serverVersionRef = useRef<number>(0);
+  const pendingMutationsRef = useRef<number>(0);
+  const allowAdminResetRef = useRef<boolean>(false);
 
   // Pure in-memory states backed 100% by server-db.json
   const [users, setUsers] = useState<User[]>(SYSTEM_USERS);
-  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [currentUser, setCurrentUser] = useState<User | null>(() => {
+    try {
+      const savedSession = sessionStorage.getItem(SESSION_USER_KEY);
+      if (savedSession) {
+        return JSON.parse(savedSession);
+      }
+    } catch {}
+    return null;
+  });
   const [workOrders, setWorkOrders] = useState<WorkOrder[]>(INITIAL_WORK_ORDERS);
   const [materials, setMaterials] = useState<Material[]>(INITIAL_MATERIALS);
   const [consumptionLogs, setConsumptionLogs] = useState<ConsumptionLog[]>(INITIAL_CONSUMPTION_LOGS);
@@ -121,47 +138,170 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setHasNewOrderNotification(false);
   };
 
-  // Authoritative state applier: directly mirrors server-db.json onto client state
-  const applyServerSnapshot = useCallback((data: any) => {
-    if (!data || typeof data !== 'object') return;
+  // Authoritative state applier with strict Anti-Wipe Guard: directly mirrors server-db.json onto client state
+  const applyServerSnapshot = useCallback((data: any, options?: { isMutationResponse?: boolean }) => {
+    // 🛡️ Guard 1: Reject null, undefined, or non-object payloads immediately
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return;
+
+    // 🛡️ Guard 2: Do not let background polling clobber an in-flight write mutation
+    if (!options?.isMutationResponse && pendingMutationsRef.current > 0) {
+      return;
+    }
+
+    // 🛡️ Guard 3: Ignore stale snapshots with older version numbers
+    if (
+      typeof data.version === 'number' &&
+      serverVersionRef.current > 0 &&
+      data.version < serverVersionRef.current &&
+      !allowAdminResetRef.current
+    ) {
+      return;
+    }
+    if (typeof data.version === 'number') {
+      serverVersionRef.current = Math.max(serverVersionRef.current, data.version);
+    }
+
     setIsSyncedWithServer(true);
 
+    // Sync tombstones from server-db.json
     if (Array.isArray(data.deletedOrderIds)) {
-      deletedOrdersRef.current = new Set(data.deletedOrderIds.filter(Boolean));
+      data.deletedOrderIds.forEach((id: string) => {
+        if (id) deletedOrdersRef.current.add(id);
+      });
+    }
+    if (Array.isArray(data.deletedMaterialIds)) {
+      data.deletedMaterialIds.forEach((id: string) => {
+        if (id) deletedMaterialsRef.current.add(id);
+      });
+    }
+    if (Array.isArray(data.deletedWorkerIds)) {
+      data.deletedWorkerIds.forEach((id: string) => {
+        if (id) deletedWorkersRef.current.add(id);
+      });
     }
 
+    // 🛡️ Guard 4: Users / Workers Anti-Wipe Guard
     if (Array.isArray(data.users) && data.users.length > 0) {
-      const sanitizedUsers = data.users.map((u: any) =>
-        u.username?.toLowerCase() === 'admin' ? { ...u, password: 'admin123' } : u
-      );
-      setUsers(sanitizedUsers);
+      const sanitizedUsers = data.users
+        .filter((u: any) => u && u.id && (!deletedWorkersRef.current.has(u.id) || u.role === 'admin'))
+        .map((u: any) => (u.username?.toLowerCase() === 'admin' ? { ...u, password: 'admin123' } : u));
+      if (sanitizedUsers.length > 0) {
+        setUsers(sanitizedUsers);
+      }
     }
 
+    // 🛡️ Guard 5: Work Orders Strict Anti-Wipe Guard
     if (Array.isArray(data.workOrders)) {
       const validServerOrders = data.workOrders.filter((o: WorkOrder) => {
         if (!o || !o.id) return false;
         if (deletedOrdersRef.current.has(o.id)) return false;
         return true;
       });
-      setWorkOrders(validServerOrders);
 
-      if (validServerOrders.length > previousOrdersCountRef.current && previousOrdersCountRef.current > 0) {
-        setHasNewOrderNotification(true);
-      }
-      previousOrdersCountRef.current = validServerOrders.length;
+      setWorkOrders((prev) => {
+        const survivingPrev = (prev || []).filter(
+          (o) => o && o.id && !deletedOrdersRef.current.has(o.id)
+        );
+
+        // Never overwrite non-empty surviving orders with an empty array unless explicitly reset by admin
+        if (validServerOrders.length === 0 && survivingPrev.length > 0 && !allowAdminResetRef.current) {
+          return survivingPrev;
+        }
+
+        if (validServerOrders.length === 0) {
+          return [];
+        }
+
+        // Merge server orders with any surviving local orders so no order is ever dropped
+        const orderMap = new Map<string, WorkOrder>();
+        validServerOrders.forEach((o: WorkOrder) => {
+          orderMap.set(o.id, o);
+        });
+        survivingPrev.forEach((o: WorkOrder) => {
+          if (!orderMap.has(o.id) && !deletedOrdersRef.current.has(o.id)) {
+            orderMap.set(o.id, o);
+          }
+        });
+
+        const merged = Array.from(orderMap.values());
+        if (merged.length > previousOrdersCountRef.current && previousOrdersCountRef.current > 0) {
+          setHasNewOrderNotification(true);
+        }
+        previousOrdersCountRef.current = merged.length;
+        return merged;
+      });
     }
 
+    // 🛡️ Guard 6: Materials (Magacin) Strict Anti-Wipe Guard
     if (Array.isArray(data.materials)) {
-      setMaterials(data.materials);
+      const validServerMaterials = data.materials.filter((m: Material) => {
+        if (!m || !m.id) return false;
+        if (deletedMaterialsRef.current.has(m.id)) return false;
+        return true;
+      });
+
+      setMaterials((prev) => {
+        const survivingPrev = (prev || []).filter(
+          (m) => m && m.id && !deletedMaterialsRef.current.has(m.id)
+        );
+
+        if (validServerMaterials.length === 0 && survivingPrev.length > 0 && !allowAdminResetRef.current) {
+          return survivingPrev;
+        }
+
+        if (validServerMaterials.length === 0) {
+          return [];
+        }
+
+        const matMap = new Map<string, Material>();
+        validServerMaterials.forEach((m: Material) => {
+          matMap.set(m.id, m);
+        });
+        survivingPrev.forEach((m: Material) => {
+          if (!matMap.has(m.id) && !deletedMaterialsRef.current.has(m.id)) {
+            matMap.set(m.id, m);
+          }
+        });
+        return Array.from(matMap.values());
+      });
     }
 
+    // 🛡️ Guard 7: Consumption Logs (Troškovi) Strict Anti-Wipe Guard
     if (Array.isArray(data.consumptionLogs)) {
-      setConsumptionLogs(data.consumptionLogs);
+      const validLogs = data.consumptionLogs.filter((l: ConsumptionLog) => l && l.id);
+
+      setConsumptionLogs((prev) => {
+        const survivingPrev = (prev || []).filter((l) => l && l.id);
+
+        if (validLogs.length === 0 && survivingPrev.length > 0 && !allowAdminResetRef.current) {
+          return survivingPrev;
+        }
+
+        if (validLogs.length === 0) {
+          return [];
+        }
+
+        const logMap = new Map<string, ConsumptionLog>();
+        validLogs.forEach((l: ConsumptionLog) => {
+          logMap.set(l.id, l);
+        });
+        survivingPrev.forEach((l: ConsumptionLog) => {
+          if (!logMap.has(l.id)) {
+            logMap.set(l.id, l);
+          }
+        });
+        return Array.from(logMap.values());
+      });
+    }
+
+    if (allowAdminResetRef.current) {
+      allowAdminResetRef.current = false;
     }
   }, []);
 
   // Central Sync Engine: Fetch live state directly from server-db.json
   const fetchServerState = useCallback(async () => {
+    if (pendingMutationsRef.current > 0) return;
     try {
       const res = await fetch(`/api/state?t=${Date.now()}`, {
         cache: 'no-store',
@@ -244,6 +384,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     };
 
     setCurrentUser(authUser);
+    try {
+      sessionStorage.setItem(SESSION_USER_KEY, JSON.stringify(authUser));
+    } catch {}
     fetchServerState();
     return { success: true };
   };
@@ -257,15 +400,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       if (fresh) {
         const permissionsChanged = JSON.stringify(fresh.permissions || {}) !== JSON.stringify(currentUser.permissions || {});
         if (permissionsChanged || fresh.fullName !== currentUser.fullName) {
-          setCurrentUser((prev) =>
-            prev
-              ? {
-                  ...prev,
-                  fullName: fresh.fullName,
-                  permissions: fresh.permissions,
-                }
-              : null
-          );
+          const updatedUser: User = {
+            ...currentUser,
+            fullName: fresh.fullName,
+            permissions: fresh.permissions,
+          };
+          setCurrentUser(updatedUser);
+          try {
+            sessionStorage.setItem(SESSION_USER_KEY, JSON.stringify(updatedUser));
+          } catch {}
         }
       }
     }
@@ -273,6 +416,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const logout = () => {
     setCurrentUser(null);
+    try {
+      sessionStorage.removeItem(SESSION_USER_KEY);
+    } catch {}
   };
 
   const getNowFormatted = () => {
@@ -311,8 +457,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       createdAt: getNowFormatted().split(' ')[0],
     };
 
+    deletedWorkersRef.current.delete(newWorker.id);
     setUsers((prev) => [...prev, newWorker]);
 
+    pendingMutationsRef.current += 1;
     fetch('/api/workers', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -320,9 +468,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     })
       .then((res) => res.json())
       .then((data) => {
-        if (data?.db) applyServerSnapshot(data.db);
+        if (data?.db) applyServerSnapshot(data.db, { isMutationResponse: true });
       })
-      .catch(console.error);
+      .catch(console.error)
+      .finally(() => {
+        pendingMutationsRef.current = Math.max(0, pendingMutationsRef.current - 1);
+      });
 
     return { success: true };
   };
@@ -347,6 +498,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       })
     );
 
+    pendingMutationsRef.current += 1;
     fetch(`/api/workers/${id}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
@@ -354,9 +506,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     })
       .then((res) => res.json())
       .then((data) => {
-        if (data?.db) applyServerSnapshot(data.db);
+        if (data?.db) applyServerSnapshot(data.db, { isMutationResponse: true });
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => {
+        pendingMutationsRef.current = Math.max(0, pendingMutationsRef.current - 1);
+      });
 
     return { success: true };
   };
@@ -381,16 +536,21 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       return { success: false, error: 'Glavni administrator se ne može obrisati.' };
     }
 
+    deletedWorkersRef.current.add(id);
     setUsers((prev) => prev.filter((u) => u.id !== id));
 
+    pendingMutationsRef.current += 1;
     fetch(`/api/workers/${id}`, {
       method: 'DELETE',
     })
       .then((res) => res.json())
       .then((data) => {
-        if (data?.db) applyServerSnapshot(data.db);
+        if (data?.db) applyServerSnapshot(data.db, { isMutationResponse: true });
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => {
+        pendingMutationsRef.current = Math.max(0, pendingMutationsRef.current - 1);
+      });
 
     return { success: true };
   };
@@ -446,6 +606,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setHasNewOrderNotification(true);
 
     // Save directly to server-db.json
+    pendingMutationsRef.current += 1;
     fetch('/api/work-orders', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -453,10 +614,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     })
       .then((res) => res.json())
       .then((data) => {
-        if (data?.db) applyServerSnapshot(data.db);
+        if (data?.db) applyServerSnapshot(data.db, { isMutationResponse: true });
       })
       .catch((err) => {
         console.warn('Network error posting work order to server:', err);
+      })
+      .finally(() => {
+        pendingMutationsRef.current = Math.max(0, pendingMutationsRef.current - 1);
       });
 
     return { success: true };
@@ -505,6 +669,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       })
     );
 
+    pendingMutationsRef.current += 1;
     fetch(`/api/work-orders/${id}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
@@ -512,9 +677,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     })
       .then((res) => res.json())
       .then((data) => {
-        if (data?.db) applyServerSnapshot(data.db);
+        if (data?.db) applyServerSnapshot(data.db, { isMutationResponse: true });
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => {
+        pendingMutationsRef.current = Math.max(0, pendingMutationsRef.current - 1);
+      });
 
     return { success: true };
   };
@@ -564,16 +732,19 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     setWorkOrders((prev) => (prev || []).filter((order) => order.id !== targetId && order.id !== id));
 
+    pendingMutationsRef.current += 1;
     try {
       const res = await fetch(`/api/work-orders/${encodeURIComponent(targetId)}`, {
         method: 'DELETE',
       });
       if (res.ok) {
         const data = await res.json();
-        if (data?.db) applyServerSnapshot(data.db);
+        if (data?.db) applyServerSnapshot(data.db, { isMutationResponse: true });
       }
     } catch (err) {
       console.warn('Network error while deleting on server:', err);
+    } finally {
+      pendingMutationsRef.current = Math.max(0, pendingMutationsRef.current - 1);
     }
 
     return { success: true };
@@ -600,6 +771,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       })
     );
 
+    pendingMutationsRef.current += 1;
     fetch(`/api/work-orders/${workOrderId}/sastavnica`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
@@ -607,9 +779,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     })
       .then((res) => res.json())
       .then((data) => {
-        if (data?.db) applyServerSnapshot(data.db);
+        if (data?.db) applyServerSnapshot(data.db, { isMutationResponse: true });
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => {
+        pendingMutationsRef.current = Math.max(0, pendingMutationsRef.current - 1);
+      });
 
     return { success: true };
   };
@@ -645,6 +820,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       )
     );
 
+    pendingMutationsRef.current += 1;
     fetch(`/api/work-orders/${workOrderId}/stoppage`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
@@ -652,9 +828,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     })
       .then((res) => res.json())
       .then((data) => {
-        if (data?.db) applyServerSnapshot(data.db);
+        if (data?.db) applyServerSnapshot(data.db, { isMutationResponse: true });
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => {
+        pendingMutationsRef.current = Math.max(0, pendingMutationsRef.current - 1);
+      });
 
     return { success: true };
   };
@@ -690,6 +869,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       )
     );
 
+    pendingMutationsRef.current += 1;
     fetch(`/api/work-orders/${workOrderId}/stoppage`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
@@ -697,9 +877,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     })
       .then((res) => res.json())
       .then((data) => {
-        if (data?.db) applyServerSnapshot(data.db);
+        if (data?.db) applyServerSnapshot(data.db, { isMutationResponse: true });
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => {
+        pendingMutationsRef.current = Math.max(0, pendingMutationsRef.current - 1);
+      });
 
     return { success: true };
   };
@@ -711,9 +894,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       return { success: false, error: 'Nemate ovlašćenje za dodavanje novog materijala.' };
     }
 
+    const uniqueMatId = `mat-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+    deletedMaterialsRef.current.delete(uniqueMatId);
+
     const newMaterial: Material = {
       ...material,
-      id: `mat-${Date.now()}`,
+      id: uniqueMatId,
       lastUpdated: getNowFormatted(),
       createdBy: {
         username: currentUser.username,
@@ -724,6 +910,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     setMaterials((prev) => [newMaterial, ...prev]);
 
+    pendingMutationsRef.current += 1;
     fetch('/api/materials', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -731,9 +918,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     })
       .then((res) => res.json())
       .then((data) => {
-        if (data?.db) applyServerSnapshot(data.db);
+        if (data?.db) applyServerSnapshot(data.db, { isMutationResponse: true });
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => {
+        pendingMutationsRef.current = Math.max(0, pendingMutationsRef.current - 1);
+      });
 
     return { success: true };
   };
@@ -751,6 +941,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       prev.map((mat) => (mat.id === id ? { ...mat, ...updatePayload } : mat))
     );
 
+    pendingMutationsRef.current += 1;
     fetch(`/api/materials/${id}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
@@ -758,9 +949,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     })
       .then((res) => res.json())
       .then((data) => {
-        if (data?.db) applyServerSnapshot(data.db);
+        if (data?.db) applyServerSnapshot(data.db, { isMutationResponse: true });
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => {
+        pendingMutationsRef.current = Math.max(0, pendingMutationsRef.current - 1);
+      });
 
     return { success: true };
   };
@@ -772,16 +966,21 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       return { success: false, error: 'Nemate ovlašćenje za brisanje materijala.' };
     }
 
+    deletedMaterialsRef.current.add(id);
     setMaterials((prev) => prev.filter((mat) => mat.id !== id));
 
+    pendingMutationsRef.current += 1;
     fetch(`/api/materials/${id}`, {
       method: 'DELETE',
     })
       .then((res) => res.json())
       .then((data) => {
-        if (data?.db) applyServerSnapshot(data.db);
+        if (data?.db) applyServerSnapshot(data.db, { isMutationResponse: true });
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => {
+        pendingMutationsRef.current = Math.max(0, pendingMutationsRef.current - 1);
+      });
 
     return { success: true };
   };
@@ -920,6 +1119,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
 
     // Push to backend server-db.json
+    pendingMutationsRef.current += 1;
     fetch('/api/consumption', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -932,9 +1132,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     })
       .then((res) => res.json())
       .then((data) => {
-        if (data?.db) applyServerSnapshot(data.db);
+        if (data?.db) applyServerSnapshot(data.db, { isMutationResponse: true });
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => {
+        pendingMutationsRef.current = Math.max(0, pendingMutationsRef.current - 1);
+      });
 
     return { success: true };
   };
@@ -970,6 +1173,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       prev.map((l) => (l.id === logId ? { ...l, quantity: newQuantity } : l))
     );
 
+    pendingMutationsRef.current += 1;
     fetch(`/api/consumption/${logId}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
@@ -977,26 +1181,42 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     })
       .then((res) => res.json())
       .then((data) => {
-        if (data?.db) applyServerSnapshot(data.db);
+        if (data?.db) applyServerSnapshot(data.db, { isMutationResponse: true });
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => {
+        pendingMutationsRef.current = Math.max(0, pendingMutationsRef.current - 1);
+      });
 
     return { success: true };
   };
 
   const resetToDefaultData = () => {
+    if (currentUser?.role !== 'admin') return;
+    allowAdminResetRef.current = true;
+    serverVersionRef.current = 0;
     setUsers(SYSTEM_USERS);
     setWorkOrders([]);
     setMaterials([]);
     setConsumptionLogs([]);
     deletedOrdersRef.current.clear();
+    deletedMaterialsRef.current.clear();
+    deletedWorkersRef.current.clear();
 
-    fetch('/api/reset', { method: 'POST' })
+    pendingMutationsRef.current += 1;
+    fetch('/api/reset', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confirmAdminReset: true, role: 'admin' }),
+    })
       .then((res) => res.json())
       .then((data) => {
-        if (data?.db) applyServerSnapshot(data.db);
+        if (data?.db) applyServerSnapshot(data.db, { isMutationResponse: true });
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => {
+        pendingMutationsRef.current = Math.max(0, pendingMutationsRef.current - 1);
+      });
   };
 
   return (
