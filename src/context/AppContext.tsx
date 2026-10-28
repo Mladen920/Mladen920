@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useState, useEffect, useRef, useCallback } from 'react';
 import { User, WorkOrder, Material, ConsumptionLog, SastavnicaInfo, MultiMaterialEntry, StoppageInfo, WorkerPermissions } from '../types';
 import { SYSTEM_USERS, INITIAL_MATERIALS, INITIAL_WORK_ORDERS, INITIAL_CONSUMPTION_LOGS } from '../data/initialData';
+import { syncDocumentToFirestore, deleteDocumentFromFirestore } from '../services/googleAuth';
 
 interface AppContextType {
   currentUser: User | null;
@@ -439,6 +440,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(newWorker),
     }).catch(console.error);
+    syncDocumentToFirestore('users', newWorker.id, newWorker);
 
     return { success: true };
   };
@@ -569,6 +571,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }).catch((err) => {
       console.warn('Network error posting work order to server:', err);
     });
+    syncDocumentToFirestore('workOrders', newOrder.id, newOrder);
 
     return { success: true };
   };
@@ -618,6 +621,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(updates),
     }).catch(() => {});
+    const existingOrder = workOrders.find((o) => o.id === id);
+    if (existingOrder) {
+      syncDocumentToFirestore('workOrders', id, { ...existingOrder, ...updates });
+    }
 
     return { success: true };
   };
@@ -687,6 +694,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     } catch (err) {
       console.warn('Network error while deleting on server:', err);
     }
+    deleteDocumentFromFirestore('workOrders', targetId, 'workOrder');
 
     return { success: true };
   };
@@ -826,6 +834,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(newMaterial),
     }).catch(() => {});
+    syncDocumentToFirestore('materials', newMaterial.id, newMaterial);
 
     return { success: true };
   };
@@ -864,6 +873,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     fetch(`/api/materials/${id}`, {
       method: 'DELETE',
     }).catch(() => {});
+    deleteDocumentFromFirestore('materials', id, 'material');
 
     return { success: true };
   };
@@ -1012,6 +1022,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         status: statusToUpdate,
       }),
     }).catch(() => {});
+    newLogs.forEach((logItem) => {
+      syncDocumentToFirestore('consumptionLogs', logItem.id, logItem);
+    });
 
     return { success: true };
   };

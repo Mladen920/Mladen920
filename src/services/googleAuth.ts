@@ -7,11 +7,122 @@ import {
   signOut,
   User 
 } from 'firebase/auth';
+import {
+  getFirestore,
+  doc,
+  getDocFromServer,
+  setDoc,
+  deleteDoc
+} from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
 
 // Initialize Firebase App singleton
-const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApp();
+export const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApp();
 export const auth = getAuth(app);
+export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+
+export enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+export interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: {
+    userId: string | undefined;
+    email: string | null | undefined;
+    emailVerified: boolean | undefined;
+    isAnonymous: boolean | undefined;
+    tenantId: string | null | undefined;
+    providerInfo: {
+      providerId: string;
+      displayName: string | null;
+      email: string | null;
+      photoUrl: string | null;
+    }[];
+  };
+}
+
+export function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null): never {
+  const errInfo: FirestoreErrorInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    authInfo: {
+      userId: auth.currentUser?.uid,
+      email: auth.currentUser?.email,
+      emailVerified: auth.currentUser?.emailVerified,
+      isAnonymous: auth.currentUser?.isAnonymous,
+      tenantId: auth.currentUser?.tenantId,
+      providerInfo: auth.currentUser?.providerData.map(provider => ({
+        providerId: provider.providerId,
+        displayName: provider.displayName,
+        email: provider.email,
+        photoUrl: provider.photoURL
+      })) || []
+    },
+    operationType,
+    path
+  };
+  console.error('Firestore Error: ', JSON.stringify(errInfo));
+  throw new Error(JSON.stringify(errInfo));
+}
+
+let connectionTested = false;
+export async function testFirebaseConnection(): Promise<void> {
+  if (connectionTested) return;
+  connectionTested = true;
+  try {
+    await getDocFromServer(doc(db, 'test', 'connection'));
+  } catch (error) {
+    if (error instanceof Error && error.message.includes('the client is offline')) {
+      console.error("Please check your Firebase configuration.");
+    }
+  }
+}
+
+// Run boot connection test once
+testFirebaseConnection();
+
+/**
+ * Safely mirror a document to Firestore when a verified Firebase Auth user is signed in.
+ */
+export async function syncDocumentToFirestore(collectionName: string, docId: string, data: Record<string, any>): Promise<void> {
+  if (!auth.currentUser || !docId) return;
+  const path = `${collectionName}/${docId}`;
+  try {
+    const cleanData = JSON.parse(JSON.stringify(data));
+    await setDoc(doc(db, collectionName, docId), cleanData, { merge: true });
+  } catch (error) {
+    console.warn(`Optional Firestore mirror skipped for ${path}:`, error);
+  }
+}
+
+/**
+ * Safely remove a document from Firestore and record its tombstone when an admin is signed in.
+ */
+export async function deleteDocumentFromFirestore(
+  collectionName: string,
+  docId: string,
+  entityType: 'workOrder' | 'material' | 'worker'
+): Promise<void> {
+  if (!auth.currentUser || !docId) return;
+  try {
+    await deleteDoc(doc(db, collectionName, docId));
+    await setDoc(doc(db, 'deletedRecords', docId), {
+      id: docId,
+      entityType,
+      deletedAt: new Date().toISOString()
+    });
+  } catch (error) {
+    console.warn(`Optional Firestore delete mirror skipped for ${collectionName}/${docId}:`, error);
+  }
+}
+
 
 // Configure Google Auth Provider with full Google Sheets & Drive scopes
 export const googleProvider = new GoogleAuthProvider();

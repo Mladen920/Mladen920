@@ -1,0 +1,119 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "Workshop user or administrator account",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique user identifier" },
+        "username": { "type": "string", "description": "Login username" },
+        "fullName": { "type": "string", "description": "Full display name" },
+        "role": { "type": "string", "enum": ["admin", "worker"], "description": "Access role in the workshop" },
+        "hourlyRate": { "type": "number", "description": "Hourly rate in KM for cost calculation" },
+        "createdAt": { "type": "string", "description": "Record creation timestamp" }
+      },
+      "required": ["id", "username", "fullName", "role"]
+    },
+    "WorkOrder": {
+      "title": "WorkOrder",
+      "description": "Manufacturing work order (Radni nalog) or preparation (Priprema)",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique work order ID" },
+        "orderNumber": { "type": "string", "description": "Formatted order number (e.g. RN-26-0001)" },
+        "customer": { "type": "string", "description": "Client or customer name" },
+        "title": { "type": "string", "description": "Order title" },
+        "description": { "type": "string", "description": "Order description" },
+        "status": {
+          "type": "string",
+          "enum": ["priprema", "na_cekanju", "u_izradi", "zavrseno", "otkazano"],
+          "description": "Current status of the work order"
+        },
+        "priority": {
+          "type": "string",
+          "enum": ["normalno", "hitno", "visoko"],
+          "description": "Order priority"
+        },
+        "dueDate": { "type": "string", "description": "Due date" },
+        "createdAt": { "type": "string", "description": "Creation timestamp" },
+        "completedAt": { "type": "string", "description": "Completion timestamp" },
+        "laborRatePerHour": { "type": "number", "description": "Hourly rate override in KM/h" },
+        "customLaborCost": { "type": "number", "description": "Direct labor cost override in KM" },
+        "otherCosts": { "type": "number", "description": "Additional overhead or transport costs in KM" },
+        "costNotes": { "type": "string", "description": "Notes regarding manufacturing costs" }
+      },
+      "required": ["id", "orderNumber", "customer", "title", "status", "createdAt"]
+    },
+    "Material": {
+      "title": "Material",
+      "description": "Inventory material item in the warehouse",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique material ID" },
+        "code": { "type": "string", "description": "Material code" },
+        "name": { "type": "string", "description": "Material name" },
+        "category": { "type": "string", "description": "Material category" },
+        "unit": { "type": "string", "enum": ["m3", "m2", "m", "kom", "kg", "l", "pak"], "description": "Unit of measure" },
+        "currentStock": { "type": "number", "description": "Current stock quantity" },
+        "minStock": { "type": "number", "description": "Minimum stock threshold" },
+        "lastUpdated": { "type": "string", "description": "Last update timestamp" },
+        "unitPrice": { "type": "number", "description": "Price per unit of measure in KM" }
+      },
+      "required": ["id", "code", "name", "unit", "currentStock", "minStock", "category", "lastUpdated"]
+    },
+    "ConsumptionLog": {
+      "title": "ConsumptionLog",
+      "description": "Material consumption and labor log entry per work order and worker",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique log ID" },
+        "workOrderId": { "type": "string", "description": "Associated work order ID" },
+        "workOrderNumber": { "type": "string", "description": "Associated work order number" },
+        "workOrderTitle": { "type": "string", "description": "Associated work order title" },
+        "workerUsername": { "type": "string", "description": "Worker username" },
+        "workerName": { "type": "string", "description": "Worker display name" },
+        "materialId": { "type": "string", "description": "Consumed material ID" },
+        "materialName": { "type": "string", "description": "Consumed material name" },
+        "quantity": { "type": "number", "description": "Quantity consumed" },
+        "unit": { "type": "string", "description": "Unit of measure" },
+        "hoursSpent": { "type": "number", "description": "Hours spent" },
+        "minutesSpent": { "type": "number", "description": "Minutes spent" },
+        "timestamp": { "type": "string", "description": "Consumption timestamp" }
+      },
+      "required": ["id", "workOrderId", "workerUsername", "materialId", "quantity", "timestamp"]
+    },
+    "DeletedRecord": {
+      "title": "DeletedRecord",
+      "description": "Permanent tombstone for deleted work orders or preparations",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Deleted entity ID" },
+        "entityType": { "type": "string", "enum": ["workOrder", "material", "worker"], "description": "Type of deleted entity" },
+        "deletedAt": { "type": "string", "description": "Deletion timestamp" }
+      },
+      "required": ["id", "entityType", "deletedAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/User" },
+      "description": "Workshop users and workers collection"
+    },
+    "/workOrders/{orderId}": {
+      "schema": { "$ref": "#/entities/WorkOrder" },
+      "description": "Work orders and preparations collection"
+    },
+    "/materials/{materialId}": {
+      "schema": { "$ref": "#/entities/Material" },
+      "description": "Warehouse materials collection"
+    },
+    "/consumptionLogs/{logId}": {
+      "schema": { "$ref": "#/entities/ConsumptionLog" },
+      "description": "Material consumption logs collection"
+    },
+    "/deletedRecords/{recordId}": {
+      "schema": { "$ref": "#/entities/DeletedRecord" },
+      "description": "Permanent tombstones of deleted IDs"
+    }
+  }
+}
