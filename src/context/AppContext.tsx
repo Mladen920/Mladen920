@@ -63,52 +63,122 @@ interface AppContextType {
   resetToDefaultData: () => void;
 }
 
-// Legacy localStorage keys to purge on startup so browser cache never causes out-of-sync data
-const LEGACY_DATA_KEYS = [
-  'rn_users_list_v5',
-  'rn_work_orders_v5',
-  'rn_materials_v5',
-  'rn_consumption_logs_v5',
-  'rn_deleted_orders_v5',
-  'rn_current_user_v5',
-];
-
 const SESSION_USER_KEY = 'rn_session_auth_user_v6';
+const SESSION_ORDERS_KEY = 'rn_session_work_orders_v6';
+const SESSION_MATERIALS_KEY = 'rn_session_materials_v6';
+const SESSION_LOGS_KEY = 'rn_session_consumption_logs_v6';
+const SESSION_USERS_KEY = 'rn_session_users_v6';
+const SESSION_TOMBSTONES_KEY = 'rn_session_tombstones_v6';
+
+interface TombstonesCache {
+  deletedOrderIds: string[];
+  deletedMaterialIds: string[];
+  deletedWorkerIds: string[];
+}
+
+function readCachedTombstones(): TombstonesCache {
+  try {
+    const raw = sessionStorage.getItem(SESSION_TOMBSTONES_KEY) || localStorage.getItem(SESSION_TOMBSTONES_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      return {
+        deletedOrderIds: Array.isArray(parsed?.deletedOrderIds) ? parsed.deletedOrderIds.filter(Boolean) : [],
+        deletedMaterialIds: Array.isArray(parsed?.deletedMaterialIds) ? parsed.deletedMaterialIds.filter(Boolean) : [],
+        deletedWorkerIds: Array.isArray(parsed?.deletedWorkerIds) ? parsed.deletedWorkerIds.filter(Boolean) : [],
+      };
+    }
+  } catch {}
+  return { deletedOrderIds: [], deletedMaterialIds: [], deletedWorkerIds: [] };
+}
+
+function writeCachedTombstones(tombstones: TombstonesCache): void {
+  try {
+    const serialized = JSON.stringify(tombstones);
+    sessionStorage.setItem(SESSION_TOMBSTONES_KEY, serialized);
+    localStorage.setItem(SESSION_TOMBSTONES_KEY, serialized);
+  } catch {}
+}
+
+function readCachedArray<T>(key: string, fallback: T[]): T[] {
+  try {
+    const sessionRaw = sessionStorage.getItem(key);
+    if (sessionRaw) {
+      const parsed = JSON.parse(sessionRaw);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        return parsed;
+      }
+    }
+    const localRaw = localStorage.getItem(key);
+    if (localRaw) {
+      const parsed = JSON.parse(localRaw);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        sessionStorage.setItem(key, localRaw);
+        return parsed;
+      }
+    }
+  } catch {}
+  return fallback;
+}
+
+function writeCachedArray<T>(key: string, items: T[], allowEmpty = false): void {
+  try {
+    if (!Array.isArray(items)) return;
+    if (items.length === 0 && !allowEmpty) {
+      return;
+    }
+    const serialized = JSON.stringify(items);
+    sessionStorage.setItem(key, serialized);
+    localStorage.setItem(key, serialized);
+  } catch {}
+}
 
 const AppContext = createContext<AppContextType | undefined>(undefined);
 
 export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  // Purge any old localStorage data caches on mount so Phone & Desktop strictly use server-db.json
-  useEffect(() => {
-    try {
-      LEGACY_DATA_KEYS.forEach((key) => localStorage.removeItem(key));
-    } catch {}
-  }, []);
+  const initialTombstones = readCachedTombstones();
 
-  // Authoritative tombstone sets from server-db.json
-  const deletedOrdersRef = useRef<Set<string>>(new Set<string>());
-  const deletedMaterialsRef = useRef<Set<string>>(new Set<string>());
-  const deletedWorkersRef = useRef<Set<string>>(new Set<string>());
+  // Authoritative tombstone sets from server-db.json & sessionStorage
+  const deletedOrdersRef = useRef<Set<string>>(new Set<string>(initialTombstones.deletedOrderIds));
+  const deletedMaterialsRef = useRef<Set<string>>(new Set<string>(initialTombstones.deletedMaterialIds));
+  const deletedWorkersRef = useRef<Set<string>>(new Set<string>(initialTombstones.deletedWorkerIds));
 
   // Track server version & active mutations so stale background polls never overwrite newer state
   const serverVersionRef = useRef<number>(0);
   const pendingMutationsRef = useRef<number>(0);
   const allowAdminResetRef = useRef<boolean>(false);
 
-  // Pure in-memory states backed 100% by server-db.json
-  const [users, setUsers] = useState<User[]>(SYSTEM_USERS);
+  // Block rendering children until /api/state is fetched and saved into sessionStorage
+  const [isInitialServerHydrated, setIsInitialServerHydrated] = useState<boolean>(false);
+
+  // Hydrate initial state from sessionStorage (prioritized & updated by /api/state before first render)
+  const [users, setUsers] = useState<User[]>(() => {
+    const cached = readCachedArray<User>(SESSION_USERS_KEY, SYSTEM_USERS);
+    return cached.filter((u) => u && u.id && (!deletedWorkersRef.current.has(u.id) || u.role === 'admin'));
+  });
+
   const [currentUser, setCurrentUser] = useState<User | null>(() => {
     try {
-      const savedSession = sessionStorage.getItem(SESSION_USER_KEY);
+      const savedSession = sessionStorage.getItem(SESSION_USER_KEY) || localStorage.getItem(SESSION_USER_KEY);
       if (savedSession) {
         return JSON.parse(savedSession);
       }
     } catch {}
     return null;
   });
-  const [workOrders, setWorkOrders] = useState<WorkOrder[]>(INITIAL_WORK_ORDERS);
-  const [materials, setMaterials] = useState<Material[]>(INITIAL_MATERIALS);
-  const [consumptionLogs, setConsumptionLogs] = useState<ConsumptionLog[]>(INITIAL_CONSUMPTION_LOGS);
+
+  const [workOrders, setWorkOrders] = useState<WorkOrder[]>(() => {
+    const cached = readCachedArray<WorkOrder>(SESSION_ORDERS_KEY, INITIAL_WORK_ORDERS);
+    return cached.filter((o) => o && o.id && !deletedOrdersRef.current.has(o.id));
+  });
+
+  const [materials, setMaterials] = useState<Material[]>(() => {
+    const cached = readCachedArray<Material>(SESSION_MATERIALS_KEY, INITIAL_MATERIALS);
+    return cached.filter((m) => m && m.id && !deletedMaterialsRef.current.has(m.id));
+  });
+
+  const [consumptionLogs, setConsumptionLogs] = useState<ConsumptionLog[]>(() => {
+    return readCachedArray<ConsumptionLog>(SESSION_LOGS_KEY, INITIAL_CONSUMPTION_LOGS);
+  });
 
   // Global Work Order creation modal (for mobile button, header button, floating button, table)
   const [isWorkOrderModalOpen, setIsWorkOrderModalOpen] = useState(false);
@@ -118,6 +188,35 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [hasNewOrderNotification, setHasNewOrderNotification] = useState<boolean>(false);
   const [isSyncedWithServer, setIsSyncedWithServer] = useState<boolean>(true);
   const previousOrdersCountRef = useRef<number>(0);
+
+  // Keep sessionStorage in sync whenever state changes (after initial hydration)
+  useEffect(() => {
+    if (!isInitialServerHydrated) return;
+    writeCachedArray(SESSION_USERS_KEY, users, false);
+  }, [users, isInitialServerHydrated]);
+
+  useEffect(() => {
+    if (!isInitialServerHydrated) return;
+    writeCachedArray(SESSION_ORDERS_KEY, workOrders, workOrders.length === 0 && deletedOrdersRef.current.size > 0);
+  }, [workOrders, isInitialServerHydrated]);
+
+  useEffect(() => {
+    if (!isInitialServerHydrated) return;
+    writeCachedArray(SESSION_MATERIALS_KEY, materials, materials.length === 0 && deletedMaterialsRef.current.size > 0);
+  }, [materials, isInitialServerHydrated]);
+
+  useEffect(() => {
+    if (!isInitialServerHydrated) return;
+    writeCachedArray(SESSION_LOGS_KEY, consumptionLogs, false);
+  }, [consumptionLogs, isInitialServerHydrated]);
+
+  const syncTombstonesToSession = useCallback(() => {
+    writeCachedTombstones({
+      deletedOrderIds: Array.from(deletedOrdersRef.current),
+      deletedMaterialIds: Array.from(deletedMaterialsRef.current),
+      deletedWorkerIds: Array.from(deletedWorkersRef.current),
+    });
+  }, []);
 
   const openCreateWorkOrderModal = (orderToEdit?: WorkOrder | null) => {
     const isAdmin = currentUser?.role === 'admin';
@@ -138,13 +237,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setHasNewOrderNotification(false);
   };
 
-  // Authoritative state applier with strict Anti-Wipe Guard: directly mirrors server-db.json onto client state
-  const applyServerSnapshot = useCallback((data: any, options?: { isMutationResponse?: boolean }) => {
+  // Authoritative state applier with strict Anti-Wipe Guard: prioritizes /api/state and saves to sessionStorage
+  const applyServerSnapshot = useCallback((
+    data: any,
+    options?: { isMutationResponse?: boolean; isInitialHydration?: boolean }
+  ) => {
     // 🛡️ Guard 1: Reject null, undefined, or non-object payloads immediately
     if (!data || typeof data !== 'object' || Array.isArray(data)) return;
 
     // 🛡️ Guard 2: Do not let background polling clobber an in-flight write mutation
-    if (!options?.isMutationResponse && pendingMutationsRef.current > 0) {
+    if (!options?.isMutationResponse && !options?.isInitialHydration && pendingMutationsRef.current > 0) {
       return;
     }
 
@@ -153,7 +255,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       typeof data.version === 'number' &&
       serverVersionRef.current > 0 &&
       data.version < serverVersionRef.current &&
-      !allowAdminResetRef.current
+      !allowAdminResetRef.current &&
+      !options?.isInitialHydration
     ) {
       return;
     }
@@ -179,18 +282,20 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         if (id) deletedWorkersRef.current.add(id);
       });
     }
+    syncTombstonesToSession();
 
-    // 🛡️ Guard 4: Users / Workers Anti-Wipe Guard
+    // 🛡️ Guard 4: Users / Workers Anti-Wipe Guard (Server prioritized)
     if (Array.isArray(data.users) && data.users.length > 0) {
       const sanitizedUsers = data.users
         .filter((u: any) => u && u.id && (!deletedWorkersRef.current.has(u.id) || u.role === 'admin'))
         .map((u: any) => (u.username?.toLowerCase() === 'admin' ? { ...u, password: 'admin123' } : u));
       if (sanitizedUsers.length > 0) {
+        writeCachedArray(SESSION_USERS_KEY, sanitizedUsers, false);
         setUsers(sanitizedUsers);
       }
     }
 
-    // 🛡️ Guard 5: Work Orders Strict Anti-Wipe Guard
+    // 🛡️ Guard 5: Work Orders Strict Anti-Wipe Guard (Server /api/state prioritized + saved to sessionStorage)
     if (Array.isArray(data.workOrders)) {
       const validServerOrders = data.workOrders.filter((o: WorkOrder) => {
         if (!o || !o.id) return false;
@@ -199,20 +304,24 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       });
 
       setWorkOrders((prev) => {
-        const survivingPrev = (prev || []).filter(
+        const cachedOrders = readCachedArray<WorkOrder>(SESSION_ORDERS_KEY, []);
+        const survivingPrev = [...(prev || []), ...cachedOrders].filter(
           (o) => o && o.id && !deletedOrdersRef.current.has(o.id)
         );
 
         // Never overwrite non-empty surviving orders with an empty array unless explicitly reset by admin
         if (validServerOrders.length === 0 && survivingPrev.length > 0 && !allowAdminResetRef.current) {
-          return survivingPrev;
+          const uniqueSurviving = Array.from(new Map(survivingPrev.map((o) => [o.id, o])).values());
+          writeCachedArray(SESSION_ORDERS_KEY, uniqueSurviving, false);
+          return uniqueSurviving;
         }
 
         if (validServerOrders.length === 0) {
+          writeCachedArray(SESSION_ORDERS_KEY, [], true);
           return [];
         }
 
-        // Merge server orders with any surviving local orders so no order is ever dropped
+        // Prioritize server orders first, then preserve any surviving local orders not yet on server
         const orderMap = new Map<string, WorkOrder>();
         validServerOrders.forEach((o: WorkOrder) => {
           orderMap.set(o.id, o);
@@ -224,6 +333,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         });
 
         const merged = Array.from(orderMap.values());
+        writeCachedArray(SESSION_ORDERS_KEY, merged, false);
+
         if (merged.length > previousOrdersCountRef.current && previousOrdersCountRef.current > 0) {
           setHasNewOrderNotification(true);
         }
@@ -232,7 +343,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       });
     }
 
-    // 🛡️ Guard 6: Materials (Magacin) Strict Anti-Wipe Guard
+    // 🛡️ Guard 6: Materials (Magacin) Strict Anti-Wipe Guard (Server /api/state prioritized + saved to sessionStorage)
     if (Array.isArray(data.materials)) {
       const validServerMaterials = data.materials.filter((m: Material) => {
         if (!m || !m.id) return false;
@@ -241,15 +352,19 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       });
 
       setMaterials((prev) => {
-        const survivingPrev = (prev || []).filter(
+        const cachedMaterials = readCachedArray<Material>(SESSION_MATERIALS_KEY, []);
+        const survivingPrev = [...(prev || []), ...cachedMaterials].filter(
           (m) => m && m.id && !deletedMaterialsRef.current.has(m.id)
         );
 
         if (validServerMaterials.length === 0 && survivingPrev.length > 0 && !allowAdminResetRef.current) {
-          return survivingPrev;
+          const uniqueSurviving = Array.from(new Map(survivingPrev.map((m) => [m.id, m])).values());
+          writeCachedArray(SESSION_MATERIALS_KEY, uniqueSurviving, false);
+          return uniqueSurviving;
         }
 
         if (validServerMaterials.length === 0) {
+          writeCachedArray(SESSION_MATERIALS_KEY, [], true);
           return [];
         }
 
@@ -262,7 +377,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             matMap.set(m.id, m);
           }
         });
-        return Array.from(matMap.values());
+        const merged = Array.from(matMap.values());
+        writeCachedArray(SESSION_MATERIALS_KEY, merged, false);
+        return merged;
       });
     }
 
@@ -271,10 +388,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const validLogs = data.consumptionLogs.filter((l: ConsumptionLog) => l && l.id);
 
       setConsumptionLogs((prev) => {
-        const survivingPrev = (prev || []).filter((l) => l && l.id);
+        const cachedLogs = readCachedArray<ConsumptionLog>(SESSION_LOGS_KEY, []);
+        const survivingPrev = [...(prev || []), ...cachedLogs].filter((l) => l && l.id);
 
         if (validLogs.length === 0 && survivingPrev.length > 0 && !allowAdminResetRef.current) {
-          return survivingPrev;
+          const uniqueSurviving = Array.from(new Map(survivingPrev.map((l) => [l.id, l])).values());
+          writeCachedArray(SESSION_LOGS_KEY, uniqueSurviving, false);
+          return uniqueSurviving;
         }
 
         if (validLogs.length === 0) {
@@ -290,18 +410,20 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             logMap.set(l.id, l);
           }
         });
-        return Array.from(logMap.values());
+        const merged = Array.from(logMap.values());
+        writeCachedArray(SESSION_LOGS_KEY, merged, false);
+        return merged;
       });
     }
 
     if (allowAdminResetRef.current) {
       allowAdminResetRef.current = false;
     }
-  }, []);
+  }, [syncTombstonesToSession]);
 
-  // Central Sync Engine: Fetch live state directly from server-db.json
-  const fetchServerState = useCallback(async () => {
-    if (pendingMutationsRef.current > 0) return;
+  // Central Sync Engine: Fetch live state directly from server-db.json (/api/state)
+  const fetchServerState = useCallback(async (isInitial = false) => {
+    if (!isInitial && pendingMutationsRef.current > 0) return;
     try {
       const res = await fetch(`/api/state?t=${Date.now()}`, {
         cache: 'no-store',
@@ -311,16 +433,75 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         },
       });
       if (!res.ok) return;
-      const data = await res.json();
-      applyServerSnapshot(data);
+      const serverData = await res.json();
+      applyServerSnapshot(serverData, { isInitialHydration: isInitial });
+
+      // If this is the initial load and sessionStorage had non-deleted items that the server lost (e.g. Render restart),
+      // push ONLY non-empty records back to /api/sync. NEVER send empty arrays [] on mount!
+      if (isInitial && serverData && typeof serverData === 'object') {
+        const currentDeletedOrders = new Set<string>([
+          ...Array.from(deletedOrdersRef.current),
+          ...(Array.isArray(serverData.deletedOrderIds) ? serverData.deletedOrderIds : []),
+        ]);
+        const currentDeletedMaterials = new Set<string>([
+          ...Array.from(deletedMaterialsRef.current),
+          ...(Array.isArray(serverData.deletedMaterialIds) ? serverData.deletedMaterialIds : []),
+        ]);
+
+        const cachedOrders = readCachedArray<WorkOrder>(SESSION_ORDERS_KEY, []).filter(
+          (o) => o && o.id && !currentDeletedOrders.has(o.id)
+        );
+        const cachedMaterials = readCachedArray<Material>(SESSION_MATERIALS_KEY, []).filter(
+          (m) => m && m.id && !currentDeletedMaterials.has(m.id)
+        );
+        const cachedLogs = readCachedArray<ConsumptionLog>(SESSION_LOGS_KEY, []).filter(
+          (l) => l && l.id
+        );
+
+        const serverOrdersCount = Array.isArray(serverData.workOrders) ? serverData.workOrders.length : 0;
+        const serverMaterialsCount = Array.isArray(serverData.materials) ? serverData.materials.length : 0;
+
+        const needsServerRecovery =
+          (cachedOrders.length > serverOrdersCount && cachedOrders.length > 0) ||
+          (cachedMaterials.length > serverMaterialsCount && cachedMaterials.length > 0);
+
+        if (needsServerRecovery) {
+          const recoveryPayload: Record<string, any> = {};
+          if (cachedOrders.length > 0) recoveryPayload.workOrders = cachedOrders;
+          if (cachedMaterials.length > 0) recoveryPayload.materials = cachedMaterials;
+          if (cachedLogs.length > 0) recoveryPayload.consumptionLogs = cachedLogs;
+
+          fetch('/api/sync', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(recoveryPayload),
+          })
+            .then((r) => r.json())
+            .then((syncRes) => {
+              if (syncRes?.db) applyServerSnapshot(syncRes.db, { isMutationResponse: true });
+            })
+            .catch(() => {});
+        }
+      }
     } catch {
       setIsSyncedWithServer(false);
+    } finally {
+      if (isInitial) {
+        setIsInitialServerHydrated(true);
+      }
     }
   }, [applyServerSnapshot]);
 
-  // Real-time SSE connection + 2-second polling fallback so Phone & Desktop are 100% identical in real time
+  // Pre-render initialization + Real-time SSE connection + 2-second polling fallback
   useEffect(() => {
-    fetchServerState();
+    let isMounted = true;
+
+    // Prioritize fetching /api/state and storing in sessionStorage BEFORE rendering children
+    fetchServerState(true).finally(() => {
+      if (isMounted) {
+        setIsInitialServerHydrated(true);
+      }
+    });
 
     let eventSource: EventSource | null = null;
     try {
@@ -337,14 +518,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     } catch {}
 
     const interval = setInterval(() => {
-      fetchServerState();
+      fetchServerState(false);
     }, 2000);
 
-    const onFocus = () => fetchServerState();
+    const onFocus = () => fetchServerState(false);
     window.addEventListener('focus', onFocus);
     window.addEventListener('online', onFocus);
 
     return () => {
+      isMounted = false;
       if (eventSource) {
         eventSource.close();
       }
@@ -355,7 +537,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   }, [fetchServerState, applyServerSnapshot]);
 
   const syncNow = async () => {
-    await fetchServerState();
+    await fetchServerState(false);
   };
 
   const login = (username: string, password: string) => {
@@ -385,9 +567,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     setCurrentUser(authUser);
     try {
-      sessionStorage.setItem(SESSION_USER_KEY, JSON.stringify(authUser));
+      const serialized = JSON.stringify(authUser);
+      sessionStorage.setItem(SESSION_USER_KEY, serialized);
+      localStorage.setItem(SESSION_USER_KEY, serialized);
     } catch {}
-    fetchServerState();
+    fetchServerState(false);
     return { success: true };
   };
 
@@ -407,7 +591,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           };
           setCurrentUser(updatedUser);
           try {
-            sessionStorage.setItem(SESSION_USER_KEY, JSON.stringify(updatedUser));
+            const serialized = JSON.stringify(updatedUser);
+            sessionStorage.setItem(SESSION_USER_KEY, serialized);
+            localStorage.setItem(SESSION_USER_KEY, serialized);
           } catch {}
         }
       }
@@ -418,6 +604,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setCurrentUser(null);
     try {
       sessionStorage.removeItem(SESSION_USER_KEY);
+      localStorage.removeItem(SESSION_USER_KEY);
     } catch {}
   };
 
@@ -458,7 +645,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     };
 
     deletedWorkersRef.current.delete(newWorker.id);
-    setUsers((prev) => [...prev, newWorker]);
+    syncTombstonesToSession();
+    setUsers((prev) => {
+      const next = [...prev, newWorker];
+      writeCachedArray(SESSION_USERS_KEY, next, false);
+      return next;
+    });
 
     pendingMutationsRef.current += 1;
     fetch('/api/workers', {
@@ -484,8 +676,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       return { success: false, error: 'Samo administrator može mijenjati radnike.' };
     }
 
-    setUsers((prev) =>
-      prev.map((u) => {
+    setUsers((prev) => {
+      const next = prev.map((u) => {
         if (u.id !== id) return u;
         return {
           ...u,
@@ -495,8 +687,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           permissions: updates.permissions !== undefined ? updates.permissions : u.permissions,
           hourlyRate: updates.hourlyRate !== undefined ? Number(updates.hourlyRate) : u.hourlyRate,
         };
-      })
-    );
+      });
+      writeCachedArray(SESSION_USERS_KEY, next, false);
+      return next;
+    });
 
     pendingMutationsRef.current += 1;
     fetch(`/api/workers/${id}`, {
@@ -537,7 +731,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
 
     deletedWorkersRef.current.add(id);
-    setUsers((prev) => prev.filter((u) => u.id !== id));
+    syncTombstonesToSession();
+    setUsers((prev) => {
+      const next = prev.filter((u) => u.id !== id);
+      writeCachedArray(SESSION_USERS_KEY, next, false);
+      return next;
+    });
 
     pendingMutationsRef.current += 1;
     fetch(`/api/workers/${id}`, {
@@ -585,6 +784,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     if (order.orderNumber) {
       deletedOrdersRef.current.delete(order.orderNumber);
     }
+    syncTombstonesToSession();
 
     const newOrder: WorkOrder = {
       ...order,
@@ -602,7 +802,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       },
     };
 
-    setWorkOrders((prev) => [newOrder, ...(prev || []).filter((o) => o.id !== newOrder.id)]);
+    setWorkOrders((prev) => {
+      const next = [newOrder, ...(prev || []).filter((o) => o.id !== newOrder.id)];
+      writeCachedArray(SESSION_ORDERS_KEY, next, false);
+      return next;
+    });
     setHasNewOrderNotification(true);
 
     // Save directly to server-db.json
@@ -657,8 +861,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       }
     }
 
-    setWorkOrders((prev) =>
-      prev.map((order) => {
+    setWorkOrders((prev) => {
+      const next = prev.map((order) => {
         if (order.id !== id) return order;
         const updated = { ...order, ...payloadUpdates };
         if (updates.status && updates.status !== 'zavrseno') {
@@ -666,8 +870,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           updated.closedBy = undefined;
         }
         return updated;
-      })
-    );
+      });
+      writeCachedArray(SESSION_ORDERS_KEY, next, false);
+      return next;
+    });
 
     pendingMutationsRef.current += 1;
     fetch(`/api/work-orders/${id}`, {
@@ -729,8 +935,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     deletedOrdersRef.current.add(targetId);
     if (id) deletedOrdersRef.current.add(id);
+    syncTombstonesToSession();
 
-    setWorkOrders((prev) => (prev || []).filter((order) => order.id !== targetId && order.id !== id));
+    setWorkOrders((prev) => {
+      const next = (prev || []).filter((order) => order.id !== targetId && order.id !== id);
+      writeCachedArray(SESSION_ORDERS_KEY, next, true);
+      return next;
+    });
 
     pendingMutationsRef.current += 1;
     try {
@@ -761,15 +972,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       evidentiranoDatum: sastavnica.evidentiranoDatum || getNowFormatted(),
     };
 
-    setWorkOrders((prev) =>
-      prev.map((order) => {
+    setWorkOrders((prev) => {
+      const next = prev.map((order) => {
         if (order.id !== workOrderId) return order;
         return {
           ...order,
           sastavnica: payload,
         };
-      })
-    );
+      });
+      writeCachedArray(SESSION_ORDERS_KEY, next, false);
+      return next;
+    });
 
     pendingMutationsRef.current += 1;
     fetch(`/api/work-orders/${workOrderId}/sastavnica`, {
@@ -812,13 +1025,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       ? [stoppage, ...order.stoppageHistory]
       : [stoppage];
 
-    setWorkOrders((prev) =>
-      prev.map((o) =>
+    setWorkOrders((prev) => {
+      const next = prev.map((o) =>
         o.id === workOrderId
           ? { ...o, stoppage, stoppageHistory: updatedHistory }
           : o
-      )
-    );
+      );
+      writeCachedArray(SESSION_ORDERS_KEY, next, false);
+      return next;
+    });
 
     pendingMutationsRef.current += 1;
     fetch(`/api/work-orders/${workOrderId}/stoppage`, {
@@ -861,13 +1076,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       ? order.stoppageHistory.map((s, idx) => (idx === 0 ? resolvedStoppage : s))
       : [resolvedStoppage];
 
-    setWorkOrders((prev) =>
-      prev.map((o) =>
+    setWorkOrders((prev) => {
+      const next = prev.map((o) =>
         o.id === workOrderId
           ? { ...o, stoppage: undefined, stoppageHistory: updatedHistory }
           : o
-      )
-    );
+      );
+      writeCachedArray(SESSION_ORDERS_KEY, next, false);
+      return next;
+    });
 
     pendingMutationsRef.current += 1;
     fetch(`/api/work-orders/${workOrderId}/stoppage`, {
@@ -896,6 +1113,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     const uniqueMatId = `mat-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
     deletedMaterialsRef.current.delete(uniqueMatId);
+    syncTombstonesToSession();
 
     const newMaterial: Material = {
       ...material,
@@ -908,7 +1126,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       },
     };
 
-    setMaterials((prev) => [newMaterial, ...prev]);
+    setMaterials((prev) => {
+      const next = [newMaterial, ...prev];
+      writeCachedArray(SESSION_MATERIALS_KEY, next, false);
+      return next;
+    });
 
     pendingMutationsRef.current += 1;
     fetch('/api/materials', {
@@ -937,9 +1159,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     const updatePayload = { ...updates, lastUpdated: getNowFormatted() };
 
-    setMaterials((prev) =>
-      prev.map((mat) => (mat.id === id ? { ...mat, ...updatePayload } : mat))
-    );
+    setMaterials((prev) => {
+      const next = prev.map((mat) => (mat.id === id ? { ...mat, ...updatePayload } : mat));
+      writeCachedArray(SESSION_MATERIALS_KEY, next, false);
+      return next;
+    });
 
     pendingMutationsRef.current += 1;
     fetch(`/api/materials/${id}`, {
@@ -967,7 +1191,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
 
     deletedMaterialsRef.current.add(id);
-    setMaterials((prev) => prev.filter((mat) => mat.id !== id));
+    syncTombstonesToSession();
+    setMaterials((prev) => {
+      const next = prev.filter((mat) => mat.id !== id);
+      writeCachedArray(SESSION_MATERIALS_KEY, next, true);
+      return next;
+    });
 
     pendingMutationsRef.current += 1;
     fetch(`/api/materials/${id}`, {
@@ -1034,8 +1263,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     let newLogs: ConsumptionLog[] = [];
 
     if (validMaterials.length > 0) {
-      setMaterials((prev) =>
-        prev.map((mat) => {
+      setMaterials((prev) => {
+        const next = prev.map((mat) => {
           const used = validMaterials.find((m) => m.materialId === mat.id);
           if (!used) return mat;
           const newStock = Math.max(0, Number((mat.currentStock - used.quantity).toFixed(4)));
@@ -1044,8 +1273,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             currentStock: newStock,
             lastUpdated: timestamp,
           };
-        })
-      );
+        });
+        writeCachedArray(SESSION_MATERIALS_KEY, next, false);
+        return next;
+      });
 
       newLogs = validMaterials.map((used, idx) => {
         const mat = materials.find((m) => m.id === used.materialId)!;
@@ -1068,7 +1299,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         };
       });
 
-      setConsumptionLogs((prev) => [...newLogs, ...prev]);
+      setConsumptionLogs((prev) => {
+        const next = [...newLogs, ...prev];
+        writeCachedArray(SESSION_LOGS_KEY, next, false);
+        return next;
+      });
     } else {
       const timeLog: ConsumptionLog = {
         id: `log-${Date.now()}`,
@@ -1088,7 +1323,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         timestamp,
       };
       newLogs = [timeLog];
-      setConsumptionLogs((prev) => [timeLog, ...prev]);
+      setConsumptionLogs((prev) => {
+        const next = [timeLog, ...prev];
+        writeCachedArray(SESSION_LOGS_KEY, next, false);
+        return next;
+      });
     }
 
     let statusToUpdate: 'zavrseno' | 'u_izradi' | undefined = undefined;
@@ -1156,8 +1395,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const diff = newQuantity - log.quantity;
 
     if (log.materialId !== 'none') {
-      setMaterials((prev) =>
-        prev.map((mat) => {
+      setMaterials((prev) => {
+        const next = prev.map((mat) => {
           if (mat.id !== log.materialId) return mat;
           const updatedStock = Math.max(0, Number((mat.currentStock - diff).toFixed(4)));
           return {
@@ -1165,13 +1404,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             currentStock: updatedStock,
             lastUpdated: getNowFormatted(),
           };
-        })
-      );
+        });
+        writeCachedArray(SESSION_MATERIALS_KEY, next, false);
+        return next;
+      });
     }
 
-    setConsumptionLogs((prev) =>
-      prev.map((l) => (l.id === logId ? { ...l, quantity: newQuantity } : l))
-    );
+    setConsumptionLogs((prev) => {
+      const next = prev.map((l) => (l.id === logId ? { ...l, quantity: newQuantity } : l));
+      writeCachedArray(SESSION_LOGS_KEY, next, false);
+      return next;
+    });
 
     pendingMutationsRef.current += 1;
     fetch(`/api/consumption/${logId}`, {
@@ -1202,6 +1445,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     deletedOrdersRef.current.clear();
     deletedMaterialsRef.current.clear();
     deletedWorkersRef.current.clear();
+    syncTombstonesToSession();
+    writeCachedArray(SESSION_ORDERS_KEY, [], true);
+    writeCachedArray(SESSION_MATERIALS_KEY, [], true);
+    writeCachedArray(SESSION_LOGS_KEY, [], true);
 
     pendingMutationsRef.current += 1;
     fetch('/api/reset', {
@@ -1256,7 +1503,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         hasPermission,
       }}
     >
-      {children}
+      {isInitialServerHydrated ? (
+        children
+      ) : (
+        <div className="min-h-screen bg-slate-950 flex flex-col items-center justify-center p-4 text-slate-200">
+          <div className="w-10 h-10 border-4 border-blue-600 border-t-transparent rounded-full animate-spin mb-3" />
+          <p className="text-sm font-medium text-slate-300">Učitavanje podataka sa servera...</p>
+        </div>
+      )}
     </AppContext.Provider>
   );
 };

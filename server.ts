@@ -194,7 +194,7 @@ function mergeDatabases(baseDb: ServerDatabase, newerDb: ServerDatabase): Server
     u.username === 'admin' ? { ...u, password: 'admin123' } : u
   );
 
-  // 2. Merge Work Orders (keep newerDb order priority, preserve any missing from baseDb)
+  // 2. Merge Work Orders (keep newerDb items as authoritative for matching IDs, preserve any missing from baseDb)
   const orderMap = new Map<string, any>();
   (newerDb.workOrders || []).forEach((o) => {
     if (o && o.id && !deletedOrderSet.has(o.id)) {
@@ -202,12 +202,8 @@ function mergeDatabases(baseDb: ServerDatabase, newerDb: ServerDatabase): Server
     }
   });
   (baseDb.workOrders || []).forEach((o) => {
-    if (o && o.id && !deletedOrderSet.has(o.id)) {
-      if (orderMap.has(o.id)) {
-        orderMap.set(o.id, { ...o, ...orderMap.get(o.id) });
-      } else {
-        orderMap.set(o.id, o);
-      }
+    if (o && o.id && !deletedOrderSet.has(o.id) && !orderMap.has(o.id)) {
+      orderMap.set(o.id, o);
     }
   });
   const workOrders = Array.from(orderMap.values());
@@ -220,12 +216,8 @@ function mergeDatabases(baseDb: ServerDatabase, newerDb: ServerDatabase): Server
     }
   });
   (baseDb.materials || []).forEach((m) => {
-    if (m && m.id && !deletedMatSet.has(m.id)) {
-      if (matMap.has(m.id)) {
-        matMap.set(m.id, { ...m, ...matMap.get(m.id) });
-      } else {
-        matMap.set(m.id, m);
-      }
+    if (m && m.id && !deletedMatSet.has(m.id) && !matMap.has(m.id)) {
+      matMap.set(m.id, m);
     }
   });
   const materials = Array.from(matMap.values());
@@ -236,12 +228,8 @@ function mergeDatabases(baseDb: ServerDatabase, newerDb: ServerDatabase): Server
     if (l && l.id) logMap.set(l.id, l);
   });
   (baseDb.consumptionLogs || []).forEach((l) => {
-    if (l && l.id) {
-      if (logMap.has(l.id)) {
-        logMap.set(l.id, { ...l, ...logMap.get(l.id) });
-      } else {
-        logMap.set(l.id, l);
-      }
+    if (l && l.id && !logMap.has(l.id)) {
+      logMap.set(l.id, l);
     }
   });
   const consumptionLogs = Array.from(logMap.values());
@@ -346,12 +334,8 @@ function writeDatabase(db: ServerDatabase, eventType?: string): boolean {
           }
         });
         survivingExistingOrders.forEach((o: any) => {
-          if (o && o.id && !mergedDeletedOrders.has(o.id)) {
-            if (orderMap.has(o.id)) {
-              orderMap.set(o.id, { ...o, ...orderMap.get(o.id) });
-            } else {
-              orderMap.set(o.id, o);
-            }
+          if (o && o.id && !mergedDeletedOrders.has(o.id) && !orderMap.has(o.id)) {
+            orderMap.set(o.id, o);
           }
         });
         db.workOrders = Array.from(orderMap.values());
@@ -373,12 +357,8 @@ function writeDatabase(db: ServerDatabase, eventType?: string): boolean {
           }
         });
         survivingExistingMaterials.forEach((m: any) => {
-          if (m && m.id && !mergedDeletedMaterials.has(m.id)) {
-            if (matMap.has(m.id)) {
-              matMap.set(m.id, { ...m, ...matMap.get(m.id) });
-            } else {
-              matMap.set(m.id, m);
-            }
+          if (m && m.id && !mergedDeletedMaterials.has(m.id) && !matMap.has(m.id)) {
+            matMap.set(m.id, m);
           }
         });
         db.materials = Array.from(matMap.values());
@@ -396,12 +376,8 @@ function writeDatabase(db: ServerDatabase, eventType?: string): boolean {
           if (l && l.id) logMap.set(l.id, l);
         });
         survivingExistingLogs.forEach((l: any) => {
-          if (l && l.id) {
-            if (logMap.has(l.id)) {
-              logMap.set(l.id, { ...l, ...logMap.get(l.id) });
-            } else {
-              logMap.set(l.id, l);
-            }
+          if (l && l.id && !logMap.has(l.id)) {
+            logMap.set(l.id, l);
           }
         });
         db.consumptionLogs = Array.from(logMap.values());
