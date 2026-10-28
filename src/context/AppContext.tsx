@@ -9,8 +9,8 @@ interface AppContextType {
   
   // Users / Workers management
   users: User[];
-  addWorker: (worker: { username: string; fullName: string; password: string; permissions?: WorkerPermissions }) => { success: boolean; error?: string };
-  updateWorker: (id: string, updates: Partial<{ username: string; fullName: string; password: string; permissions: WorkerPermissions }>) => { success: boolean; error?: string };
+  addWorker: (worker: { username: string; fullName: string; password: string; permissions?: WorkerPermissions; hourlyRate?: number }) => { success: boolean; error?: string };
+  updateWorker: (id: string, updates: Partial<{ username: string; fullName: string; password: string; permissions: WorkerPermissions; hourlyRate?: number }>) => { success: boolean; error?: string };
   deleteWorker: (id: string) => { success: boolean; error?: string };
   hasPermission: (permissionKey: keyof WorkerPermissions) => boolean;
 
@@ -402,7 +402,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   // Add Worker
-  const addWorker = (worker: { username: string; fullName: string; password: string; permissions?: WorkerPermissions }) => {
+  const addWorker = (worker: { username: string; fullName: string; password: string; permissions?: WorkerPermissions; hourlyRate?: number }) => {
     if (currentUser?.role !== 'admin') {
       return { success: false, error: 'Samo administrator može unositi radnike.' };
     }
@@ -427,6 +427,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       role: 'worker',
       password: trimmedPass,
       permissions: worker.permissions || {},
+      hourlyRate: worker.hourlyRate !== undefined ? Number(worker.hourlyRate) : 15,
       createdAt: getNowFormatted().split(' ')[0],
     };
 
@@ -443,7 +444,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   // Update Worker
-  const updateWorker = (id: string, updates: Partial<{ username: string; fullName: string; password: string; permissions: WorkerPermissions }>) => {
+  const updateWorker = (id: string, updates: Partial<{ username: string; fullName: string; password: string; permissions: WorkerPermissions; hourlyRate?: number }>) => {
     if (currentUser?.role !== 'admin') {
       return { success: false, error: 'Samo administrator može mijenjati radnike.' };
     }
@@ -457,6 +458,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           username: updates.username !== undefined ? updates.username.trim() : u.username,
           password: updates.password !== undefined ? updates.password.trim() : u.password,
           permissions: updates.permissions !== undefined ? updates.permissions : u.permissions,
+          hourlyRate: updates.hourlyRate !== undefined ? Number(updates.hourlyRate) : u.hourlyRate,
         };
       })
     );

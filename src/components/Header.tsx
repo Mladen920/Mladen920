@@ -12,7 +12,8 @@ import {
   LayoutList, 
   FileSpreadsheet, 
   Plus, 
-  Compass 
+  Compass,
+  Coins 
 } from 'lucide-react';
 import { GoogleSheetsSyncModal } from './common/GoogleSheetsSyncModal';
 import { NotificationCenter } from './common/NotificationCenter';
@@ -129,6 +130,19 @@ export const Header: React.FC<HeaderProps> = ({ currentTab, setCurrentTab }) => 
                       {lowStockMaterialsCount}
                     </span>
                   )}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setCurrentTab('costs')}
+                  className={`flex items-center gap-1 px-2 lg:px-2.5 py-1 text-xs font-semibold rounded-md transition-colors shrink-0 cursor-pointer ${
+                    currentTab === 'costs'
+                      ? 'bg-slate-800 text-white shadow-inner font-bold'
+                      : 'text-slate-300 hover:text-white hover:bg-slate-800/60'
+                  }`}
+                >
+                  <Coins className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                  <span>Troškovi</span>
                 </button>
 
                 <button
@@ -390,6 +404,22 @@ export const Header: React.FC<HeaderProps> = ({ currentTab, setCurrentTab }) => 
                 </div>
                 <span className="text-[10px] sm:text-[11px] font-semibold mt-0.5 tracking-tight truncate w-full text-center">
                   Materijali
+                </span>
+              </button>
+
+              {/* Troškovi */}
+              <button
+                type="button"
+                onClick={() => setCurrentTab('costs')}
+                className={`relative flex flex-col items-center justify-center py-1.5 px-0.5 rounded-lg transition-colors cursor-pointer min-w-0 ${
+                  currentTab === 'costs'
+                    ? 'bg-slate-800 text-amber-400 font-bold border-b-2 border-amber-400 shadow-xs'
+                    : 'text-slate-400 hover:text-white hover:bg-slate-800/50'
+                }`}
+              >
+                <Coins className="w-4 h-4 shrink-0" />
+                <span className="text-[10px] sm:text-[11px] font-semibold mt-0.5 tracking-tight truncate w-full text-center">
+                  Troškovi
                 </span>
               </button>
 

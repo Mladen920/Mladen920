@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Material, UnitOfMeasure } from '../../types';
 import { useApp } from '../../context/AppContext';
-import { X, PackagePlus, AlertCircle, Box } from 'lucide-react';
+import { X, PackagePlus, AlertCircle, Box, Coins } from 'lucide-react';
 
 interface MaterialModalProps {
   isOpen: boolean;
@@ -32,6 +32,7 @@ export const MaterialModal: React.FC<MaterialModalProps> = ({
   const [unit, setUnit] = useState<UnitOfMeasure>('kom');
   const [currentStock, setCurrentStock] = useState<string>('0');
   const [minStock, setMinStock] = useState<string>('0');
+  const [unitPrice, setUnitPrice] = useState<string>('0');
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -42,6 +43,7 @@ export const MaterialModal: React.FC<MaterialModalProps> = ({
       setUnit(materialToEdit.unit || 'kom');
       setCurrentStock((materialToEdit.currentStock ?? 0).toString());
       setMinStock((materialToEdit.minStock ?? 0).toString());
+      setUnitPrice((materialToEdit.unitPrice ?? 0).toString());
     } else {
       const nextIndex = materials.length + 1;
       setCode(`MAT-${(100 + nextIndex).toString()}`);
@@ -50,6 +52,7 @@ export const MaterialModal: React.FC<MaterialModalProps> = ({
       setUnit('kom');
       setCurrentStock('0');
       setMinStock('0');
+      setUnitPrice('0');
     }
     setError(null);
   }, [materialToEdit, isOpen, materials.length]);
@@ -71,6 +74,7 @@ export const MaterialModal: React.FC<MaterialModalProps> = ({
 
     const parsedStock = parseFloat(currentStock);
     const parsedMin = parseFloat(minStock);
+    const parsedPrice = parseFloat(unitPrice);
 
     if (isNaN(parsedStock) || parsedStock < 0) {
       setError('Količina zalihe mora biti važeći pozitivan broj.');
@@ -82,6 +86,11 @@ export const MaterialModal: React.FC<MaterialModalProps> = ({
       return;
     }
 
+    if (isNaN(parsedPrice) || parsedPrice < 0) {
+      setError('Cijena po jedinici mjere mora biti važeći broj (0 ili veći).');
+      return;
+    }
+
     if (materialToEdit) {
       const res = updateMaterial(materialToEdit.id, {
         code: code.trim(),
@@ -90,6 +99,7 @@ export const MaterialModal: React.FC<MaterialModalProps> = ({
         unit,
         currentStock: parsedStock,
         minStock: parsedMin,
+        unitPrice: parsedPrice,
       });
       if (!res.success) {
         setError(res.error || 'Greška pri izmjeni materijala.');
@@ -103,6 +113,7 @@ export const MaterialModal: React.FC<MaterialModalProps> = ({
         unit,
         currentStock: parsedStock,
         minStock: parsedMin,
+        unitPrice: parsedPrice,
       });
       if (!res.success) {
         setError(res.error || 'Greška pri dodavanju materijala.');
@@ -242,6 +253,36 @@ export const MaterialModal: React.FC<MaterialModalProps> = ({
                 className="w-full px-3 py-2 bg-white border border-slate-300 rounded-lg text-xs font-mono font-medium text-slate-900 focus:outline-none focus:ring-2 focus:ring-emerald-500"
               />
             </div>
+          </div>
+
+          {/* Cijena po jedinici mjere */}
+          <div className="p-3.5 bg-amber-50/60 border border-amber-200/80 rounded-xl space-y-1.5">
+            <label className="block text-xs font-bold text-amber-950 flex items-center justify-between">
+              <span className="flex items-center gap-1.5">
+                <Coins className="w-4 h-4 text-amber-600" />
+                Cijena po jedinici mjere ({unit})
+              </span>
+              <span className="text-[10px] text-amber-800 font-semibold bg-amber-100/90 px-1.5 py-0.5 rounded">
+                Za troškove RN
+              </span>
+            </label>
+            <div className="relative">
+              <input
+                type="number"
+                step="0.01"
+                min="0"
+                value={unitPrice}
+                onChange={(e) => setUnitPrice(e.target.value)}
+                placeholder="0.00"
+                className="w-full pl-3 pr-16 py-2 bg-white border border-amber-300 rounded-lg text-xs font-mono font-bold text-slate-900 focus:outline-none focus:ring-2 focus:ring-amber-500"
+              />
+              <span className="absolute right-3 top-1/2 -translate-y-1/2 text-xs font-bold text-amber-800 font-mono">
+                KM / {unit}
+              </span>
+            </div>
+            <p className="text-[11px] text-amber-900/80 leading-relaxed">
+              Unesite jediničnu cijenu materijala (npr. cijena za 1 {unit}). Ova cijena se automatski koristi u novoj sekciji <strong>Troškovi izrade</strong> za obračun ukupnog utroška materijala po radnom nalogu.
+            </p>
           </div>
 
           {/* Action buttons */}

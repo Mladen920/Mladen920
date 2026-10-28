@@ -17,6 +17,7 @@ export interface User {
   password?: string;
   createdAt?: string;
   permissions?: WorkerPermissions;
+  hourlyRate?: number; // Zadana satnica radnika (KM/h)
 }
 
 export type OrderStatus = 'priprema' | 'na_cekanju' | 'u_izradi' | 'zavrseno' | 'otkazano';
@@ -95,6 +96,13 @@ export interface WorkOrder {
   stoppage?: StoppageInfo; // Trenutni / aktivni zastoj
   stoppageHistory?: StoppageInfo[]; // Istorija svih zabeleženih zastoja
   modelPreparation?: ModelPreparationInfo; // Detalji pripreme modela
+
+  // Finansijski troškovi izrade (Manufacturing Costs)
+  laborRatePerHour?: number; // Ručno uneta ili zadata satnica za radnike na ovom RN (KM/h)
+  customLaborCost?: number; // Ručno uneta fiksna/prilagođena ukupna cijena rada radnika za ovaj RN (KM)
+  workerRates?: Record<string, number>; // Satnica po radniku { [workerUsername]: hourlyRate }
+  otherCosts?: number; // Ostali troškovi (prevoz, montaža, okov, kooperacija...)
+  costNotes?: string; // Bilješka o troškovima
 }
 
 export interface Material {
@@ -107,6 +115,7 @@ export interface Material {
   category: string;
   lastUpdated: string;
   createdBy?: CreatedByInfo; // Ko je unio materijal
+  unitPrice?: number; // Cijena materijala po jedinici mjere (KM/JM)
 }
 
 export interface ConsumptionLog {

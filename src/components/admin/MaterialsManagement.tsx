@@ -238,6 +238,7 @@ export const MaterialsManagement: React.FC = () => {
                 <th className="py-2.5 px-3">Naziv materijala</th>
                 <th className="py-2.5 px-3">Kategorija</th>
                 <th className="py-2.5 px-3 text-center">Jedinica</th>
+                <th className="py-2.5 px-3 text-right">Cijena / JM</th>
                 <th className="py-2.5 px-3 text-right">Trenutna zaliha</th>
                 <th className="py-2.5 px-3 text-right">Minimalna zaliha</th>
                 <th className="py-2.5 px-3 text-center">Status lagera</th>
@@ -247,7 +248,7 @@ export const MaterialsManagement: React.FC = () => {
             <tbody className="divide-y divide-slate-100">
               {filteredMaterials.length === 0 ? (
                 <tr>
-                  <td colSpan={8} className="py-12 text-center text-slate-500">
+                  <td colSpan={9} className="py-12 text-center text-slate-500">
                     <Layers className="w-8 h-8 text-slate-300 mx-auto mb-2" />
                     <p className="font-medium text-sm text-slate-700">Baza materijala je prazna</p>
                     <p className="text-xs text-slate-400 mt-1">
@@ -306,6 +307,19 @@ export const MaterialsManagement: React.FC = () => {
                         <span className="font-mono font-bold px-2 py-0.5 rounded text-xs bg-slate-100 text-slate-800 border border-slate-200">
                           {mat.unit}
                         </span>
+                      </td>
+
+                      {/* Unit Price */}
+                      <td className="py-2.5 px-3 text-right font-mono font-bold tabular-nums whitespace-nowrap">
+                        {mat.unitPrice && mat.unitPrice > 0 ? (
+                          <span className="text-amber-900 bg-amber-50 px-2 py-0.5 rounded border border-amber-200 text-xs">
+                            {mat.unitPrice.toFixed(2)} KM
+                          </span>
+                        ) : (
+                          <span className="text-slate-400 font-normal text-[11px]">
+                            0.00 KM
+                          </span>
+                        )}
                       </td>
 
                       {/* Current Stock */}

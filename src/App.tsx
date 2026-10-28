@@ -7,6 +7,7 @@ import { MaterialsManagement } from './components/admin/MaterialsManagement';
 import { WorkersManagement } from './components/admin/WorkersManagement';
 import { ReportsDashboard } from './components/admin/ReportsDashboard';
 import { ModelPreparationManagement } from './components/admin/ModelPreparationManagement';
+import { ManufacturingCostsManagement } from './components/admin/ManufacturingCostsManagement';
 import { WorkerDashboard } from './components/worker/WorkerDashboard';
 import { WorkOrderModal } from './components/admin/WorkOrderModal';
 import { Plus } from 'lucide-react';
@@ -40,6 +41,7 @@ const MainLayout: React.FC = () => {
             {currentTab === 'orders' && <WorkOrdersTable onNavigateToModels={() => setCurrentTab('models')} />}
             {currentTab === 'models' && <ModelPreparationManagement />}
             {currentTab === 'materials' && <MaterialsManagement />}
+            {currentTab === 'costs' && <ManufacturingCostsManagement />}
             {currentTab === 'workers' && <WorkersManagement />}
             {currentTab === 'reports' && <ReportsDashboard />}
           </>
@@ -53,6 +55,7 @@ const MainLayout: React.FC = () => {
             )}
             {currentTab === 'models' && canPrepareModels && <ModelPreparationManagement />}
             {currentTab === 'materials' && canManageMaterials && <MaterialsManagement />}
+            {currentTab === 'costs' && canViewReports && <ManufacturingCostsManagement />}
             {currentTab === 'reports' && canViewReports && <ReportsDashboard />}
           </>
         )}

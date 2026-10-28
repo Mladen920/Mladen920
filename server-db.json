@@ -85,11 +85,23 @@
       }
     }
   ],
-  "materials": [],
+  "materials": [
+    {
+      "id": "mat-test-1",
+      "code": "MAT-101",
+      "name": "Hrast Masiv 24mm",
+      "category": "Pločasti materijali",
+      "unit": "m3",
+      "currentStock": 5.5,
+      "minStock": 1,
+      "unitPrice": 280,
+      "lastUpdated": "2026-10-28T08:50:00.000Z"
+    }
+  ],
   "consumptionLogs": [],
   "deletedOrderIds": [
     "wo-test-persistence-123"
   ],
-  "version": 11,
-  "lastUpdated": "2026-10-28T07:51:25.464Z"
+  "version": 12,
+  "lastUpdated": "2026-10-28T08:57:11.421Z"
 }
