@@ -62,6 +62,21 @@ interface ServerDatabase {
 // In-memory cache singleton - Single Source of Truth
 let memoryDb: ServerDatabase | null = null;
 
+// Connected SSE clients for instant real-time synchronization across Phone & Desktop
+const sseClients = new Set<Response>();
+
+function broadcastDatabaseUpdate(db: ServerDatabase) {
+  if (sseClients.size === 0) return;
+  const payload = `data: ${JSON.stringify(db)}\n\n`;
+  sseClients.forEach((clientRes) => {
+    try {
+      clientRes.write(payload);
+    } catch {
+      sseClients.delete(clientRes);
+    }
+  });
+}
+
 const cloneDb = (db: ServerDatabase): ServerDatabase => {
   return JSON.parse(JSON.stringify(db));
 };
@@ -102,6 +117,9 @@ function writeDatabase(db: ServerDatabase, eventType?: string): boolean {
 
     // Notice: Automatic external network sync (Google Sheets/Git) is deliberately DISABLED here.
     // All order and warehouse operations are stored locally and atomically to avoid Quota Exceeded errors.
+
+    // 4. Broadcast updated authoritative database to all connected phones & computers in real time
+    broadcastDatabaseUpdate(memoryDb);
 
     return true;
   } catch (err) {
@@ -409,12 +427,17 @@ async function syncFromExternalSheets(): Promise<ServerDatabase | null> {
 async function startServer() {
   const app = express();
 
-  // Basic CORS & JSON parser
+  // Basic CORS & JSON parser + strict no-cache for API routes
   app.use(express.json({ limit: '10mb' }));
   app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Cache-Control, Pragma');
+    if (req.path.startsWith('/api/')) {
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+      res.setHeader('Pragma', 'no-cache');
+      res.setHeader('Expires', '0');
+    }
     if (req.method === 'OPTIONS') {
       return res.sendStatus(200);
     }
@@ -422,7 +445,35 @@ async function startServer() {
   });
 
   // API Endpoints - Single Source of Truth for ALL devices (Desktop, Mobile, Tablet)
-  
+
+  // Real-time Server-Sent Events (SSE) stream for instant multi-device sync
+  app.get('/api/events', (req: Request, res: Response) => {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders?.();
+
+    const db = readDatabase();
+    res.write(`data: ${JSON.stringify(db)}\n\n`);
+
+    sseClients.add(res);
+
+    const heartbeat = setInterval(() => {
+      try {
+        res.write(': heartbeat\n\n');
+      } catch {
+        clearInterval(heartbeat);
+        sseClients.delete(res);
+      }
+    }, 20000);
+
+    req.on('close', () => {
+      clearInterval(heartbeat);
+      sseClients.delete(res);
+    });
+  });
+
   // 1. Get full live application state (with optional on-demand refresh from Google Sheets)
   app.get('/api/state', async (req: Request, res: Response) => {
     if (req.query.refresh === 'true' && GOOGLE_SHEETS_API_URL) {
@@ -544,9 +595,9 @@ async function startServer() {
       return res.status(500).json({ success: false, error: 'Integritet baze ugrožen - operacija prekinuta.' });
     }
 
-    writeDatabase(db, 'work_order_created');
+    writeDatabase(db, 'work_order_Created');
     console.log(`✅ [Work Order Created] Nalog "${newOrder.orderNumber}" (ID: ${newOrder.id}) uspešno sačuvan. Ukupno naloga u bazi: ${db.workOrders.length}`);
-    res.json({ success: true, workOrder: newOrder, workOrders: db.workOrders });
+    res.json({ success: true, workOrder: newOrder, workOrders: db.workOrders, db });
   });
 
   app.put('/api/work-orders/:id', (req: Request, res: Response) => {
@@ -576,7 +627,7 @@ async function startServer() {
 
     db.workOrders[idx] = { ...db.workOrders[idx], ...updates };
     writeDatabase(db, 'work_order_updated');
-    res.json({ success: true, workOrder: db.workOrders[idx], workOrders: db.workOrders });
+    res.json({ success: true, workOrder: db.workOrders[idx], workOrders: db.workOrders, db });
   });
 
   app.delete('/api/work-orders/:id', (req: Request, res: Response) => {
@@ -605,16 +656,22 @@ async function startServer() {
 
     writeDatabase(db, 'work_order_deleted');
     console.log(`🗑️ [Delete Work Order] Trajno obrisan nalog/priprema ID: ${idToDelete}. Preostalo naloga u bazi: ${db.workOrders.length}`);
-    res.json({ success: true, workOrders: db.workOrders, deletedOrderIds: db.deletedOrderIds });
+    res.json({ success: true, workOrders: db.workOrders, deletedOrderIds: db.deletedOrderIds, db });
   });
 
   // 4. Materials
   app.post('/api/materials', (req: Request, res: Response) => {
     const newMaterial = req.body;
     const db = readDatabase();
-    db.materials.push(newMaterial);
+    if (!Array.isArray(db.materials)) db.materials = [];
+    const existingIdx = db.materials.findIndex(m => m.id === newMaterial.id);
+    if (existingIdx >= 0) {
+      db.materials[existingIdx] = { ...db.materials[existingIdx], ...newMaterial };
+    } else {
+      db.materials.unshift(newMaterial);
+    }
     writeDatabase(db, 'material_created');
-    res.json({ success: true, materials: db.materials });
+    res.json({ success: true, materials: db.materials, db });
   });
 
   app.put('/api/materials/:id', (req: Request, res: Response) => {
@@ -626,7 +683,7 @@ async function startServer() {
       db.materials[idx] = { ...db.materials[idx], ...updates };
       writeDatabase(db, 'material_updated');
     }
-    res.json({ success: true, materials: db.materials });
+    res.json({ success: true, materials: db.materials, db });
   });
 
   app.delete('/api/materials/:id', (req: Request, res: Response) => {
@@ -634,7 +691,7 @@ async function startServer() {
     const db = readDatabase();
     db.materials = db.materials.filter(m => m.id !== id);
     writeDatabase(db, 'material_deleted');
-    res.json({ success: true, materials: db.materials });
+    res.json({ success: true, materials: db.materials, db });
   });
 
   // 5. Workers
@@ -647,7 +704,7 @@ async function startServer() {
     }
     db.users.push(newWorker);
     writeDatabase(db, 'worker_created');
-    res.json({ success: true, users: db.users });
+    res.json({ success: true, users: db.users, db });
   });
 
   app.put('/api/workers/:id', (req: Request, res: Response) => {
@@ -659,7 +716,7 @@ async function startServer() {
       db.users[idx] = { ...db.users[idx], ...updates };
       writeDatabase(db, 'worker_updated');
     }
-    res.json({ success: true, users: db.users });
+    res.json({ success: true, users: db.users, db });
   });
 
   app.delete('/api/workers/:id', (req: Request, res: Response) => {
@@ -667,7 +724,7 @@ async function startServer() {
     const db = readDatabase();
     db.users = db.users.filter(u => u.id !== id);
     writeDatabase(db, 'worker_deleted');
-    res.json({ success: true, users: db.users });
+    res.json({ success: true, users: db.users, db });
   });
 
   // 6. Consumption & Completion Logging

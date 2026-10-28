@@ -63,92 +63,35 @@ interface AppContextType {
   resetToDefaultData: () => void;
 }
 
-const STORAGE_KEYS = {
-  USER: 'rn_current_user_v5',
-  USERS_LIST: 'rn_users_list_v5',
-  WORK_ORDERS: 'rn_work_orders_v5',
-  MATERIALS: 'rn_materials_v5',
-  CONSUMPTION_LOGS: 'rn_consumption_logs_v5',
-  DELETED_ORDERS: 'rn_deleted_orders_v5',
-};
-
-const getInitialDeletedOrderIds = (): Set<string> => {
-  try {
-    const saved = localStorage.getItem(STORAGE_KEYS.DELETED_ORDERS);
-    if (saved) {
-      const parsed = JSON.parse(saved);
-      if (Array.isArray(parsed)) return new Set(parsed);
-    }
-  } catch {}
-  return new Set<string>();
-};
+// Legacy localStorage keys to purge on startup so browser cache never causes out-of-sync data
+const LEGACY_DATA_KEYS = [
+  'rn_users_list_v5',
+  'rn_work_orders_v5',
+  'rn_materials_v5',
+  'rn_consumption_logs_v5',
+  'rn_deleted_orders_v5',
+  'rn_current_user_v5',
+];
 
 const AppContext = createContext<AppContextType | undefined>(undefined);
 
 export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  // Ref for deleted order IDs to immediately prevent resurrecting deleted orders/preparations
-  const deletedOrdersRef = useRef<Set<string>>(getInitialDeletedOrderIds());
-
-  // Local states
-  const [users, setUsers] = useState<User[]>(() => {
+  // Purge any old localStorage caches on mount so Phone & Desktop strictly use server-db.json
+  useEffect(() => {
     try {
-      const saved = localStorage.getItem(STORAGE_KEYS.USERS_LIST);
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          return parsed.map((u: User) =>
-            u.username.toLowerCase() === 'admin' ? { ...u, password: 'admin123' } : u
-          );
-        }
-      }
-      return SYSTEM_USERS;
-    } catch {
-      return SYSTEM_USERS;
-    }
-  });
+      LEGACY_DATA_KEYS.forEach((key) => localStorage.removeItem(key));
+    } catch {}
+  }, []);
 
-  const [currentUser, setCurrentUser] = useState<User | null>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEYS.USER);
-      return saved ? JSON.parse(saved) : null;
-    } catch {
-      return null;
-    }
-  });
+  // Authoritative tombstone set from server-db.json
+  const deletedOrdersRef = useRef<Set<string>>(new Set<string>());
 
-  const [workOrders, setWorkOrders] = useState<WorkOrder[]>(() => {
-    try {
-      const deletedSet = getInitialDeletedOrderIds();
-      const saved = localStorage.getItem(STORAGE_KEYS.WORK_ORDERS);
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          return parsed.filter((o: WorkOrder) => o && o.id && !deletedSet.has(o.id));
-        }
-      }
-      return INITIAL_WORK_ORDERS.filter((o) => o && o.id && !deletedSet.has(o.id));
-    } catch {
-      return INITIAL_WORK_ORDERS;
-    }
-  });
-
-  const [materials, setMaterials] = useState<Material[]>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEYS.MATERIALS);
-      return saved ? JSON.parse(saved) : INITIAL_MATERIALS;
-    } catch {
-      return INITIAL_MATERIALS;
-    }
-  });
-
-  const [consumptionLogs, setConsumptionLogs] = useState<ConsumptionLog[]>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEYS.CONSUMPTION_LOGS);
-      return saved ? JSON.parse(saved) : INITIAL_CONSUMPTION_LOGS;
-    } catch {
-      return INITIAL_CONSUMPTION_LOGS;
-    }
-  });
+  // Pure in-memory states backed 100% by server-db.json
+  const [users, setUsers] = useState<User[]>(SYSTEM_USERS);
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [workOrders, setWorkOrders] = useState<WorkOrder[]>(INITIAL_WORK_ORDERS);
+  const [materials, setMaterials] = useState<Material[]>(INITIAL_MATERIALS);
+  const [consumptionLogs, setConsumptionLogs] = useState<ConsumptionLog[]>(INITIAL_CONSUMPTION_LOGS);
 
   // Global Work Order creation modal (for mobile button, header button, floating button, table)
   const [isWorkOrderModalOpen, setIsWorkOrderModalOpen] = useState(false);
@@ -157,33 +100,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   // Notification for new orders
   const [hasNewOrderNotification, setHasNewOrderNotification] = useState<boolean>(false);
   const [isSyncedWithServer, setIsSyncedWithServer] = useState<boolean>(true);
-  const serverVersionRef = useRef<number>(0);
-  const previousOrdersCountRef = useRef<number>(workOrders.length);
-
-  // Local storage cache updates
-  useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.USERS_LIST, JSON.stringify(users));
-  }, [users]);
-
-  useEffect(() => {
-    if (currentUser) {
-      localStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(currentUser));
-    } else {
-      localStorage.removeItem(STORAGE_KEYS.USER);
-    }
-  }, [currentUser]);
-
-  useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.WORK_ORDERS, JSON.stringify(workOrders));
-  }, [workOrders]);
-
-  useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.MATERIALS, JSON.stringify(materials));
-  }, [materials]);
-
-  useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.CONSUMPTION_LOGS, JSON.stringify(consumptionLogs));
-  }, [consumptionLogs]);
+  const previousOrdersCountRef = useRef<number>(0);
 
   const openCreateWorkOrderModal = (orderToEdit?: WorkOrder | null) => {
     const isAdmin = currentUser?.role === 'admin';
@@ -204,137 +121,98 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setHasNewOrderNotification(false);
   };
 
-  const workOrdersRef = useRef(workOrders);
-  workOrdersRef.current = workOrders;
-  const materialsRef = useRef(materials);
-  materialsRef.current = materials;
-  const usersRef = useRef(users);
-  usersRef.current = users;
-  const consumptionLogsRef = useRef(consumptionLogs);
-  consumptionLogsRef.current = consumptionLogs;
+  // Authoritative state applier: directly mirrors server-db.json onto client state
+  const applyServerSnapshot = useCallback((data: any) => {
+    if (!data || typeof data !== 'object') return;
+    setIsSyncedWithServer(true);
 
-  // Central Sync Engine: Fetch live state from backend safely without deleting local records
-  const fetchServerState = useCallback(async () => {
-    try {
-      const res = await fetch('/api/state');
-      if (!res.ok) return;
-      const data = await res.json();
-      setIsSyncedWithServer(true);
-      
-      if (data.version && data.version >= serverVersionRef.current) {
-        serverVersionRef.current = data.version;
+    if (Array.isArray(data.deletedOrderIds)) {
+      deletedOrdersRef.current = new Set(data.deletedOrderIds.filter(Boolean));
+    }
 
-        if (Array.isArray(data.users) && data.users.length > 0) {
-          const sanitizedUsers = data.users.map((u: any) =>
-            u.username?.toLowerCase() === 'admin' ? { ...u, password: 'admin123' } : u
-          );
-          setUsers((prev) => {
-            const userMap = new Map<string, User>();
-            prev.forEach((u) => userMap.set(u.id, u));
-            sanitizedUsers.forEach((u: User) => userMap.set(u.id, { ...userMap.get(u.id), ...u }));
-            return Array.from(userMap.values());
-          });
-        }
+    if (Array.isArray(data.users) && data.users.length > 0) {
+      const sanitizedUsers = data.users.map((u: any) =>
+        u.username?.toLowerCase() === 'admin' ? { ...u, password: 'admin123' } : u
+      );
+      setUsers(sanitizedUsers);
+    }
 
-        if (Array.isArray(data.deletedOrderIds)) {
-          let updatedTombstones = false;
-          data.deletedOrderIds.forEach((id: string) => {
-            if (id && !deletedOrdersRef.current.has(id)) {
-              deletedOrdersRef.current.add(id);
-              updatedTombstones = true;
-            }
-          });
-          if (updatedTombstones) {
-            try {
-              localStorage.setItem(STORAGE_KEYS.DELETED_ORDERS, JSON.stringify(Array.from(deletedOrdersRef.current)));
-            } catch {}
-          }
-        }
+    if (Array.isArray(data.workOrders)) {
+      const validServerOrders = data.workOrders.filter((o: WorkOrder) => {
+        if (!o || !o.id) return false;
+        if (deletedOrdersRef.current.has(o.id)) return false;
+        return true;
+      });
+      setWorkOrders(validServerOrders);
 
-        if (Array.isArray(data.workOrders)) {
-          // Strictly exclude any work orders or preparations that have been explicitly deleted!
-          const validServerOrders = data.workOrders.filter((o: WorkOrder) => {
-            if (!o || !o.id) return false;
-            if (deletedOrdersRef.current.has(o.id)) return false;
-            return true;
-          });
-
-          setWorkOrders((prev) => {
-            // Safety guard: If server temporarily returned 0 orders, NEVER wipe client local orders!
-            if (validServerOrders.length === 0 && (prev || []).length > 0) {
-              return prev;
-            }
-
-            const orderMap = new Map<string, WorkOrder>();
-            // 1. Keep existing client orders first so nothing in memory or local storage is lost
-            (prev || []).forEach((o: WorkOrder) => {
-              if (o && o.id && !deletedOrdersRef.current.has(o.id)) {
-                orderMap.set(o.id, o);
-              }
-            });
-
-            // 2. Merge server orders
-            validServerOrders.forEach((o: WorkOrder) => {
-              const existing = orderMap.get(o.id);
-              orderMap.set(o.id, { ...existing, ...o });
-            });
-
-            const merged = Array.from(orderMap.values());
-            try {
-              localStorage.setItem(STORAGE_KEYS.WORK_ORDERS, JSON.stringify(merged));
-            } catch {}
-            return merged;
-          });
-
-          if (validServerOrders.length > previousOrdersCountRef.current && previousOrdersCountRef.current > 0) {
-            setHasNewOrderNotification(true);
-          }
-          previousOrdersCountRef.current = validServerOrders.length;
-        }
-
-        if (Array.isArray(data.materials) && data.materials.length > 0) {
-          setMaterials((prev) => {
-            const matMap = new Map<string, Material>();
-            (prev || []).forEach((m) => matMap.set(m.id, m));
-            data.materials.forEach((m: Material) => matMap.set(m.id, { ...matMap.get(m.id), ...m }));
-            return Array.from(matMap.values());
-          });
-        }
-
-        if (Array.isArray(data.consumptionLogs) && data.consumptionLogs.length > 0) {
-          setConsumptionLogs((prev) => {
-            const logMap = new Map<string, ConsumptionLog>();
-            (prev || []).forEach((l) => logMap.set(l.id, l));
-            data.consumptionLogs.forEach((l: ConsumptionLog) => logMap.set(l.id, l));
-            return Array.from(logMap.values());
-          });
-        }
-
-        setIsSyncedWithServer(true);
+      if (validServerOrders.length > previousOrdersCountRef.current && previousOrdersCountRef.current > 0) {
+        setHasNewOrderNotification(true);
       }
-    } catch {
-      // Offline fallback: keep local storage
-      setIsSyncedWithServer(false);
+      previousOrdersCountRef.current = validServerOrders.length;
+    }
+
+    if (Array.isArray(data.materials)) {
+      setMaterials(data.materials);
+    }
+
+    if (Array.isArray(data.consumptionLogs)) {
+      setConsumptionLogs(data.consumptionLogs);
     }
   }, []);
 
-  // Periodic polling to keep Phone & Desktop completely in sync
+  // Central Sync Engine: Fetch live state directly from server-db.json
+  const fetchServerState = useCallback(async () => {
+    try {
+      const res = await fetch(`/api/state?t=${Date.now()}`, {
+        cache: 'no-store',
+        headers: {
+          'Cache-Control': 'no-cache',
+          'Pragma': 'no-cache',
+        },
+      });
+      if (!res.ok) return;
+      const data = await res.json();
+      applyServerSnapshot(data);
+    } catch {
+      setIsSyncedWithServer(false);
+    }
+  }, [applyServerSnapshot]);
+
+  // Real-time SSE connection + 2-second polling fallback so Phone & Desktop are 100% identical in real time
   useEffect(() => {
     fetchServerState();
+
+    let eventSource: EventSource | null = null;
+    try {
+      eventSource = new EventSource('/api/events');
+      eventSource.onmessage = (event) => {
+        try {
+          const parsed = JSON.parse(event.data);
+          applyServerSnapshot(parsed);
+        } catch {}
+      };
+      eventSource.onerror = () => {
+        // Fallback polling continues seamlessly if SSE reconnects
+      };
+    } catch {}
+
     const interval = setInterval(() => {
       fetchServerState();
-    }, 3000);
+    }, 2000);
 
     const onFocus = () => fetchServerState();
     window.addEventListener('focus', onFocus);
     window.addEventListener('online', onFocus);
 
     return () => {
+      if (eventSource) {
+        eventSource.close();
+      }
       clearInterval(interval);
       window.removeEventListener('focus', onFocus);
       window.removeEventListener('online', onFocus);
     };
-  }, [fetchServerState]);
+  }, [fetchServerState, applyServerSnapshot]);
 
   const syncNow = async () => {
     await fetchServerState();
@@ -366,10 +244,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     };
 
     setCurrentUser(authUser);
+    fetchServerState();
     return { success: true };
   };
 
-  // Keep currentUser synchronized with latest worker record in state
+  // Keep currentUser synchronized with latest worker record from server
   useEffect(() => {
     if (currentUser) {
       const fresh = users.find(
@@ -434,12 +313,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     setUsers((prev) => [...prev, newWorker]);
 
-    // Send to central server
     fetch('/api/workers', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(newWorker),
-    }).catch(console.error);
+    })
+      .then((res) => res.json())
+      .then((data) => {
+        if (data?.db) applyServerSnapshot(data.db);
+      })
+      .catch(console.error);
 
     return { success: true };
   };
@@ -468,7 +351,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(updates),
-    }).catch(() => {});
+    })
+      .then((res) => res.json())
+      .then((data) => {
+        if (data?.db) applyServerSnapshot(data.db);
+      })
+      .catch(() => {});
 
     return { success: true };
   };
@@ -497,7 +385,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     fetch(`/api/workers/${id}`, {
       method: 'DELETE',
-    }).catch(() => {});
+    })
+      .then((res) => res.json())
+      .then((data) => {
+        if (data?.db) applyServerSnapshot(data.db);
+      })
+      .catch(() => {});
 
     return { success: true };
   };
@@ -528,14 +421,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const assigned = order.assignedWorkers || [];
     const uniqueId = `wo-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
 
-    // Remove new unique ID and orderNumber from tombstones
     deletedOrdersRef.current.delete(uniqueId);
     if (order.orderNumber) {
       deletedOrdersRef.current.delete(order.orderNumber);
     }
-    try {
-      localStorage.setItem(STORAGE_KEYS.DELETED_ORDERS, JSON.stringify(Array.from(deletedOrdersRef.current)));
-    } catch {}
 
     const newOrder: WorkOrder = {
       ...order,
@@ -553,23 +442,22 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       },
     };
 
-    setWorkOrders((prev) => {
-      const next = [newOrder, ...(prev || []).filter(o => o.id !== newOrder.id)];
-      try {
-        localStorage.setItem(STORAGE_KEYS.WORK_ORDERS, JSON.stringify(next));
-      } catch {}
-      return next;
-    });
+    setWorkOrders((prev) => [newOrder, ...(prev || []).filter((o) => o.id !== newOrder.id)]);
     setHasNewOrderNotification(true);
 
-    // Sync to backend so Desktop and Phone see it immediately
+    // Save directly to server-db.json
     fetch('/api/work-orders', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(newOrder),
-    }).catch((err) => {
-      console.warn('Network error posting work order to server:', err);
-    });
+    })
+      .then((res) => res.json())
+      .then((data) => {
+        if (data?.db) applyServerSnapshot(data.db);
+      })
+      .catch((err) => {
+        console.warn('Network error posting work order to server:', err);
+      });
 
     return { success: true };
   };
@@ -591,22 +479,25 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       }
     }
 
+    const payloadUpdates: Partial<WorkOrder> = { ...updates };
+    if (updates.status === 'zavrseno') {
+      if (!payloadUpdates.completedAt) {
+        payloadUpdates.completedAt = getNowFormatted();
+      }
+      if (!payloadUpdates.closedBy && currentUser) {
+        payloadUpdates.closedBy = {
+          username: currentUser.username,
+          fullName: currentUser.fullName,
+          timestamp: payloadUpdates.completedAt,
+        };
+      }
+    }
+
     setWorkOrders((prev) =>
       prev.map((order) => {
         if (order.id !== id) return order;
-        const updated = { ...order, ...updates };
-        if (updates.status === 'zavrseno') {
-          if (!updated.completedAt) {
-            updated.completedAt = getNowFormatted();
-          }
-          if (!updated.closedBy && currentUser) {
-            updated.closedBy = {
-              username: currentUser.username,
-              fullName: currentUser.fullName,
-              timestamp: updated.completedAt,
-            };
-          }
-        } else if (updates.status) {
+        const updated = { ...order, ...payloadUpdates };
+        if (updates.status && updates.status !== 'zavrseno') {
           updated.completedAt = undefined;
           updated.closedBy = undefined;
         }
@@ -617,8 +508,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     fetch(`/api/work-orders/${id}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(updates),
-    }).catch(() => {});
+      body: JSON.stringify(payloadUpdates),
+    })
+      .then((res) => res.json())
+      .then((data) => {
+        if (data?.db) applyServerSnapshot(data.db);
+      })
+      .catch(() => {});
 
     return { success: true };
   };
@@ -653,7 +549,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     return res;
   };
 
-  // Delete work order / model preparation permanently
+  // Delete work order / model preparation permanently on server
   const deleteWorkOrder = async (id: string) => {
     const canDelete = currentUser?.role === 'admin' || Boolean(currentUser?.permissions?.canDeleteOrders);
     if (!currentUser || !canDelete) {
@@ -663,28 +559,19 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const targetOrder = workOrders.find((o) => o.id === id);
     const targetId = targetOrder?.id || id;
 
-    // 1. Permanently register unique ID in tombstones
     deletedOrdersRef.current.add(targetId);
     if (id) deletedOrdersRef.current.add(id);
 
-    try {
-      localStorage.setItem(STORAGE_KEYS.DELETED_ORDERS, JSON.stringify(Array.from(deletedOrdersRef.current)));
-    } catch {}
+    setWorkOrders((prev) => (prev || []).filter((order) => order.id !== targetId && order.id !== id));
 
-    // 2. Immediately purge from local state and localStorage
-    setWorkOrders((prev) => {
-      const filtered = (prev || []).filter((order) => order.id !== targetId && order.id !== id);
-      try {
-        localStorage.setItem(STORAGE_KEYS.WORK_ORDERS, JSON.stringify(filtered));
-      } catch {}
-      return filtered;
-    });
-
-    // 3. Inform server to delete from database and record tombstone (await to ensure completion before any refresh)
     try {
-      await fetch(`/api/work-orders/${encodeURIComponent(targetId)}`, {
+      const res = await fetch(`/api/work-orders/${encodeURIComponent(targetId)}`, {
         method: 'DELETE',
       });
+      if (res.ok) {
+        const data = await res.json();
+        if (data?.db) applyServerSnapshot(data.db);
+      }
     } catch (err) {
       console.warn('Network error while deleting on server:', err);
     }
@@ -717,7 +604,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ sastavnica: payload }),
-    }).catch(() => {});
+    })
+      .then((res) => res.json())
+      .then((data) => {
+        if (data?.db) applyServerSnapshot(data.db);
+      })
+      .catch(() => {});
 
     return { success: true };
   };
@@ -757,7 +649,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ stoppage, stoppageHistory: updatedHistory }),
-    }).catch(() => {});
+    })
+      .then((res) => res.json())
+      .then((data) => {
+        if (data?.db) applyServerSnapshot(data.db);
+      })
+      .catch(() => {});
 
     return { success: true };
   };
@@ -797,7 +694,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ stoppage: null, stoppageHistory: updatedHistory }),
-    }).catch(() => {});
+    })
+      .then((res) => res.json())
+      .then((data) => {
+        if (data?.db) applyServerSnapshot(data.db);
+      })
+      .catch(() => {});
 
     return { success: true };
   };
@@ -826,7 +728,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(newMaterial),
-    }).catch(() => {});
+    })
+      .then((res) => res.json())
+      .then((data) => {
+        if (data?.db) applyServerSnapshot(data.db);
+      })
+      .catch(() => {});
 
     return { success: true };
   };
@@ -848,7 +755,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(updatePayload),
-    }).catch(() => {});
+    })
+      .then((res) => res.json())
+      .then((data) => {
+        if (data?.db) applyServerSnapshot(data.db);
+      })
+      .catch(() => {});
 
     return { success: true };
   };
@@ -864,7 +776,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     fetch(`/api/materials/${id}`, {
       method: 'DELETE',
-    }).catch(() => {});
+    })
+      .then((res) => res.json())
+      .then((data) => {
+        if (data?.db) applyServerSnapshot(data.db);
+      })
+      .catch(() => {});
 
     return { success: true };
   };
@@ -1002,7 +919,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       updateWorkOrder(targetOrder.id, { status: 'u_izradi' });
     }
 
-    // Push to backend
+    // Push to backend server-db.json
     fetch('/api/consumption', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1012,7 +929,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         closedBy: closedByObj,
         status: statusToUpdate,
       }),
-    }).catch(() => {});
+    })
+      .then((res) => res.json())
+      .then((data) => {
+        if (data?.db) applyServerSnapshot(data.db);
+      })
+      .catch(() => {});
 
     return { success: true };
   };
@@ -1052,7 +974,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ quantity: newQuantity }),
-    }).catch(() => {});
+    })
+      .then((res) => res.json())
+      .then((data) => {
+        if (data?.db) applyServerSnapshot(data.db);
+      })
+      .catch(() => {});
 
     return { success: true };
   };
@@ -1063,13 +990,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setMaterials([]);
     setConsumptionLogs([]);
     deletedOrdersRef.current.clear();
-    localStorage.removeItem(STORAGE_KEYS.USERS_LIST);
-    localStorage.removeItem(STORAGE_KEYS.WORK_ORDERS);
-    localStorage.removeItem(STORAGE_KEYS.MATERIALS);
-    localStorage.removeItem(STORAGE_KEYS.CONSUMPTION_LOGS);
-    localStorage.removeItem(STORAGE_KEYS.DELETED_ORDERS);
 
-    fetch('/api/reset', { method: 'POST' }).catch(() => {});
+    fetch('/api/reset', { method: 'POST' })
+      .then((res) => res.json())
+      .then((data) => {
+        if (data?.db) applyServerSnapshot(data.db);
+      })
+      .catch(() => {});
   };
 
   return (
